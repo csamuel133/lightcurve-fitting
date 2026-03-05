@@ -1,6 +1,8 @@
 pub mod batch;
 pub mod common;
 pub mod gp;
+#[cfg(feature = "cuda")]
+pub mod gpu;
 pub mod nonparametric;
 pub mod parametric;
 pub mod thermal;
