@@ -70,7 +70,8 @@ def load_source(npz_path):
     return bands
 
 
-def select_sources(rows, n_total, min_events=10):
+def select_sources(rows, n_total, min_events=10, prefer_most_points=False,
+                    max_events_by_label=None):
     """Select a balanced sample across labels."""
     # Group by label
     by_label = defaultdict(list)
@@ -78,6 +79,9 @@ def select_sources(rows, n_total, min_events=10):
         n_events = int(row["n_events"])
         if n_events < min_events:
             continue
+        if max_events_by_label and row["label"] in max_events_by_label:
+            if n_events > max_events_by_label[row["label"]]:
+                continue
         obj_id = row["obj_id"]
         local_path = PHOTO_EVENTS_DIR / "train" / f"{obj_id}.npz"
         if local_path.exists():
@@ -90,17 +94,25 @@ def select_sources(rows, n_total, min_events=10):
     selected = []
     for label in sorted(by_label.keys()):
         candidates = by_label[label]
-        # Sort by n_events to get diversity (small and large)
-        candidates.sort(key=lambda x: x[3])
-        # Take evenly spaced samples
-        n_take = min(per_label, len(candidates))
-        if remainder > 0 and len(candidates) > per_label:
-            n_take += 1
-            remainder -= 1
-        step = max(len(candidates) / n_take, 1.0)
-        for i in range(n_take):
-            idx = min(int(i * step), len(candidates) - 1)
-            selected.append(candidates[idx])
+        if prefer_most_points:
+            # Take the sources with the most observations
+            candidates.sort(key=lambda x: x[3], reverse=True)
+            n_take = min(per_label, len(candidates))
+            if remainder > 0 and len(candidates) > per_label:
+                n_take += 1
+                remainder -= 1
+            selected.extend(candidates[:n_take])
+        else:
+            # Take evenly spaced samples for diversity
+            candidates.sort(key=lambda x: x[3])
+            n_take = min(per_label, len(candidates))
+            if remainder > 0 and len(candidates) > per_label:
+                n_take += 1
+                remainder -= 1
+            step = max(len(candidates) / n_take, 1.0)
+            for i in range(n_take):
+                idx = min(int(i * step), len(candidates) - 1)
+                selected.append(candidates[idx])
 
     return selected[:n_total]
 
@@ -135,8 +147,13 @@ def main():
     with open(MANIFEST) as f:
         rows = list(csv.DictReader(f))
 
-    # --- Small fixture (20 sources) ---
-    selected_small = select_sources(rows, 20, min_events=10)
+    # --- Small fixture (20 sources, best-sampled per class) ---
+    # For SN types (labels 0-6), cap at 500 to avoid host-contaminated sources
+    # that have 1000+ points spanning years (not actual transients).
+    # AGN (8), Cataclysmic (7), TDE (9) legitimately have long baselines.
+    selected_small = select_sources(rows, 20, min_events=10,
+                                    prefer_most_points=True,
+                                    max_events_by_label={str(i): 500 for i in range(7)})
     sources_small = build_fixture(selected_small)
 
     small_path = FIXTURES_DIR / "real_sources.json"

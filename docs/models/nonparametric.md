@@ -130,7 +130,19 @@ band:
 
 ## Example Images
 
+![SN Ia GP fit](../img/np_sn_ia.png)
+
 ![SN II GP fit](../img/np_sn_ii.png)
+
+![SN IIP GP fit](../img/np_sn_iip.png)
+
+![SN IIn GP fit](../img/np_sn_iin.png)
+
+![SN IIb GP fit](../img/np_sn_iib.png)
+
+![SN Ib GP fit](../img/np_sn_ib.png)
+
+![SN Ic GP fit](../img/np_sn_ic.png)
 
 ![TDE GP fit](../img/np_tde.png)
 
