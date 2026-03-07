@@ -8,8 +8,12 @@ use ::lightcurve_fitting::{
     build_flux_bands as rs_build_flux_bands, build_mag_bands as rs_build_mag_bands,
     eval_model_flux as rs_eval_model_flux, fit_batch_fast as rs_fit_batch_fast,
     fit_batch_parametric as rs_fit_batch_parametric,
-    fit_nonparametric as rs_fit_nonparametric, fit_parametric as rs_fit_parametric,
-    fit_thermal as rs_fit_thermal, BandData, FastFitResult, SviModelName, UncertaintyMethod,
+    fit_nonparametric as rs_fit_nonparametric,
+    fit_nonparametric_with_opts as rs_fit_nonparametric_with_opts,
+    fit_parametric as rs_fit_parametric,
+    fit_thermal as rs_fit_thermal, fit_gp_predict as rs_fit_gp_predict,
+    metzger_kn_mags as rs_metzger_kn_mags,
+    BandData, FastFitResult, SviModelName, UncertaintyMethod,
 };
 
 // ---------------------------------------------------------------------------
@@ -130,11 +134,19 @@ fn parse_uncertainty_method(method: &str) -> PyResult<UncertaintyMethod> {
 ///
 /// Returns a list of dicts, one per band, containing GP-derived features
 /// (peak_mag, rise_time, decay_time, FWHM, derivatives, etc.).
+///
+/// Args:
+///     bands: Magnitude-space band data.
+///     max_subsample: Maximum number of points for the dense GP subsample
+///         (default 25). Only affects bands with >100 observations that use
+///         the sparse FITC approximation — controls the secondary DenseGP
+///         used for thermal reuse.
 #[pyfunction]
-fn fit_nonparametric(py: Python<'_>, bands: &PyBandDataMap) -> PyResult<PyObject> {
+#[pyo3(signature = (bands, max_subsample=25))]
+fn fit_nonparametric(py: Python<'_>, bands: &PyBandDataMap, max_subsample: usize) -> PyResult<PyObject> {
     let inner = bands.inner.clone();
     let results = py.allow_threads(|| {
-        let (results, _gps) = rs_fit_nonparametric(&inner);
+        let (results, _gps) = rs_fit_nonparametric_with_opts(&inner, max_subsample);
         results
     });
     Ok(pythonize(py, &results)?.unbind())
@@ -183,10 +195,11 @@ fn fit_thermal(py: Python<'_>, bands: &PyBandDataMap) -> PyResult<PyObject> {
 /// Returns a dict with ``"nonparametric"`` (list of dicts) and ``"thermal"``
 /// (dict or None) keys.
 #[pyfunction]
-fn fit_fast(py: Python<'_>, bands: &PyBandDataMap) -> PyResult<PyObject> {
+#[pyo3(signature = (bands, max_subsample=25))]
+fn fit_fast(py: Python<'_>, bands: &PyBandDataMap, max_subsample: usize) -> PyResult<PyObject> {
     let inner = bands.inner.clone();
     let result = py.allow_threads(|| {
-        let (nonpar, gps) = rs_fit_nonparametric(&inner);
+        let (nonpar, gps) = rs_fit_nonparametric_with_opts(&inner, max_subsample);
         let thermal = rs_fit_thermal(&inner, Some(&gps));
         FastFitResult {
             nonparametric: nonpar,
@@ -262,6 +275,105 @@ fn fit_batch_parametric(
 }
 
 // ---------------------------------------------------------------------------
+// GP prediction
+// ---------------------------------------------------------------------------
+
+/// Fit a Gaussian Process to training data and predict at query points.
+///
+/// Performs a grid search over amplitude and lengthscale candidates, using
+/// the mean squared measurement error as the GP alpha parameter.
+///
+/// Args:
+///     train_times: Training time values.
+///     train_values: Training observed values.
+///     train_errors: Training measurement errors.
+///     query_times: Times at which to predict.
+///     amp_candidates: Amplitude values to try in grid search.
+///     ls_candidates: Lengthscale values to try in grid search.
+///
+/// Returns a tuple of (predictions, std_devs) or None if fitting fails.
+#[pyfunction]
+fn fit_gp_predict(
+    py: Python<'_>,
+    train_times: Vec<f64>,
+    train_values: Vec<f64>,
+    train_errors: Vec<f64>,
+    query_times: Vec<f64>,
+    amp_candidates: Vec<f64>,
+    ls_candidates: Vec<f64>,
+) -> PyResult<Option<(Vec<f64>, Vec<f64>)>> {
+    let result = py.allow_threads(|| {
+        rs_fit_gp_predict(
+            &train_times,
+            &train_values,
+            &train_errors,
+            &query_times,
+            &amp_candidates,
+            &ls_candidates,
+        )
+    });
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Kilonova model
+// ---------------------------------------------------------------------------
+
+/// Evaluate the Metzger kilonova model in physical magnitude space.
+///
+/// Unlike `eval_model("MetzgerKN", ...)` which returns normalized flux,
+/// this evaluates the full physical model and returns AB magnitudes per band.
+///
+/// Args:
+///     params: Physical parameters [log10(M_ej/Msun), log10(v_ej/c),
+///         log10(kappa), t0_offset].
+///     times: Observation times (days).
+///     band_frequencies: List of (band_name, frequency_hz) tuples, e.g.
+///         [("g", 6.3e14), ("r", 4.7e14), ("i", 3.9e14)].
+///     d_l_cm: Luminosity distance in cm.
+///
+/// Returns a dict of ``{band_name: [mag_values]}``.
+#[pyfunction]
+fn metzger_kn_mags(
+    py: Python<'_>,
+    params: Vec<f64>,
+    times: Vec<f64>,
+    band_frequencies: Vec<(String, f64)>,
+    d_l_cm: f64,
+) -> PyResult<PyObject> {
+    let bands: Vec<(&str, f64)> = band_frequencies.iter().map(|(n, f)| (n.as_str(), *f)).collect();
+    let result = py.allow_threads(|| rs_metzger_kn_mags(&params, &times, &bands, d_l_cm));
+    Ok(pythonize(py, &result)?.unbind())
+}
+
+// ---------------------------------------------------------------------------
+// Batch nonparametric
+// ---------------------------------------------------------------------------
+
+/// Batch nonparametric GP fitting for multiple sources (parallel).
+///
+/// Like `fit_batch_fast` but without the thermal step.
+///
+/// Args:
+///     sources: List of `BandDataMap` objects (magnitude data).
+///
+/// Returns a list of (list of dicts), one inner list per source.
+#[pyfunction]
+fn fit_batch_nonparametric(py: Python<'_>, sources: Vec<PyBandDataMap>) -> PyResult<PyObject> {
+    let inner: Vec<HashMap<String, BandData>> = sources.into_iter().map(|s| s.inner).collect();
+    let results: Vec<Vec<::lightcurve_fitting::NonparametricBandResult>> = py.allow_threads(|| {
+        use rayon::prelude::*;
+        inner.par_iter()
+            .map(|bands| {
+                let (results, _gps) = rs_fit_nonparametric(bands);
+                results
+            })
+            .collect()
+    });
+    Ok(pythonize(py, &results)?.unbind())
+}
+
+// ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
 
@@ -276,6 +388,9 @@ fn lightcurve_fitting(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fit_fast, m)?)?;
     m.add_function(wrap_pyfunction!(eval_model, m)?)?;
     m.add_function(wrap_pyfunction!(fit_batch_fast, m)?)?;
+    m.add_function(wrap_pyfunction!(fit_batch_nonparametric, m)?)?;
     m.add_function(wrap_pyfunction!(fit_batch_parametric, m)?)?;
+    m.add_function(wrap_pyfunction!(fit_gp_predict, m)?)?;
+    m.add_function(wrap_pyfunction!(metzger_kn_mags, m)?)?;
     Ok(())
 }

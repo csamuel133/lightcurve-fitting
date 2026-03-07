@@ -28,3 +28,6 @@ core.*
 
 # Test data
 photometry.json
+
+# Documentation build output
+site/

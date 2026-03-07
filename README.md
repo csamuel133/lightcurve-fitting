@@ -28,6 +28,19 @@ let p_results  = fit_parametric(&flux_bands, false, UncertaintyMethod::Laplace);
 let t_result   = fit_thermal(&mag_bands, Some(&trained_gps));
 ```
 
+## GPU acceleration (optional)
+
+When built with `--features cuda`, the parametric fitter uses CUDA batch PSO
+to fit all sources simultaneously on a GPU. This provides significant speedup
+at scale (see [Benchmarks](#benchmarks)).
+
+```sh
+cargo build --release --features cuda
+```
+
+Requires CUDA toolkit (tested with 12.x). The build system auto-detects
+`nvcc` via the `CUDA_PATH` environment variable or standard locations.
+
 ## Building
 
 ```sh
@@ -42,13 +55,37 @@ Run the unit and integration tests:
 cargo test
 ```
 
-Run the throughput benchmark (10 synthetic sources × 3 fitters):
+Run GPU-specific tests (requires CUDA):
 
 ```sh
-cargo test --release throughput -- --ignored
+cargo test --features cuda --test test_gpu -- --nocapture
 ```
 
-This writes `wall_time.txt` with the elapsed seconds.
+## Benchmarks
+
+Throughput benchmarks measure scaling across two axes:
+
+- **Source-count scaling**: fixed 30 pts/band, 10–1,000 sources
+- **Point-count scaling**: fixed 100 sources, 10–500 pts/band
+
+Run the full benchmark suite:
+
+```sh
+# With GPU
+cargo test --release --features cuda --test bench_throughput -- --ignored --nocapture
+
+# CPU only
+cargo test --release --test bench_throughput -- --ignored --nocapture
+
+# Generate plots
+python3 benchmarks/plot_throughput.py
+
+# Submit as SLURM job
+sbatch benchmarks/run_bench.sh
+```
+
+Results are written to `benchmarks/throughput_results.csv`.
+See [docs/benchmarks.md](docs/benchmarks.md) for full methodology and results.
 
 ## CI
 

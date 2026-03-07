@@ -808,13 +808,20 @@ pub fn metzger_kn_mags(
 
 #[inline]
 fn eval_model_batch(model: SviModel, params: &[f64], times: &[f64]) -> Vec<f64> {
+    let mut out = vec![0.0; times.len()];
+    eval_model_batch_into(model, params, times, &mut out);
+    out
+}
+
+/// Write model predictions into a pre-allocated buffer (avoids allocation in hot loops).
+fn eval_model_batch_into(model: SviModel, params: &[f64], times: &[f64], out: &mut [f64]) {
     if model.is_sequential() {
-        metzger_kn_eval_batch(params, times)
+        let batch = metzger_kn_eval_batch(params, times);
+        out[..times.len()].copy_from_slice(&batch);
     } else {
-        times
-            .iter()
-            .map(|&t| eval_model(model, params, t))
-            .collect()
+        for (i, &t) in times.iter().enumerate() {
+            out[i] = eval_model(model, params, t);
+        }
     }
 }
 
@@ -890,26 +897,25 @@ struct PsoCost<'a> {
     model: SviModel,
 }
 
-impl CostFunction for PsoCost<'_> {
-    type Param = Vec<f64>;
-    type Output = f64;
-
-    fn cost(&self, p: &Self::Param) -> Result<Self::Output, ArgminError> {
+impl PsoCost<'_> {
+    /// Hot-path cost evaluation that takes a slice (no Vec allocation) and
+    /// reuses a prediction buffer.
+    #[inline]
+    fn cost_from_slice(&self, p: &[f64], pred_buf: &mut [f64]) -> f64 {
         let se_idx = self.model.sigma_extra_idx();
         let sigma_extra = p[se_idx].exp();
         let sigma_extra_sq = sigma_extra * sigma_extra;
-        let mut preds = eval_model_batch(self.model, p, self.times);
+        eval_model_batch_into(self.model, p, self.times, pred_buf);
 
         if self.model == SviModel::MetzgerKN {
-            let max_pred = preds
-                .iter()
+            let max_pred = pred_buf.iter()
                 .zip(self.is_upper.iter())
                 .filter(|(_, is_up)| !**is_up)
                 .map(|(p, _)| *p)
                 .fold(f64::NEG_INFINITY, f64::max);
             if max_pred > 1e-10 && max_pred.is_finite() {
                 let scale = (1.0 / max_pred).clamp(0.1, 10.0);
-                for pred in preds.iter_mut() {
+                for pred in pred_buf[..self.times.len()].iter_mut() {
                     *pred *= scale;
                 }
             }
@@ -918,9 +924,9 @@ impl CostFunction for PsoCost<'_> {
         let n = self.times.len().max(1) as f64;
         let mut neg_ll = 0.0;
         for i in 0..self.times.len() {
-            let pred = preds[i];
+            let pred = pred_buf[i];
             if !pred.is_finite() {
-                return Ok(1e99);
+                return 1e99;
             }
             let total_var = self.obs_var[i] + sigma_extra_sq;
             if self.is_upper[i] {
@@ -931,7 +937,17 @@ impl CostFunction for PsoCost<'_> {
                 neg_ll += diff * diff / total_var + total_var.ln();
             }
         }
-        Ok(neg_ll / n)
+        neg_ll / n
+    }
+}
+
+impl CostFunction for PsoCost<'_> {
+    type Param = Vec<f64>;
+    type Output = f64;
+
+    fn cost(&self, p: &Self::Param) -> Result<Self::Output, ArgminError> {
+        let mut preds = vec![0.0; self.times.len()];
+        Ok(self.cost_from_slice(p, &mut preds))
     }
 }
 
@@ -992,7 +1008,7 @@ fn pso_bounds_no_t0(model: SviModel) -> (Vec<f64>, Vec<f64>) {
 /// best cost has not improved by more than `stall_tol` (relative) for
 /// `stall_iters` consecutive iterations.
 fn pso_minimize(
-    cost_fn: impl Fn(&[f64]) -> f64,
+    mut cost_fn: impl FnMut(&[f64]) -> f64,
     lower: &[f64],
     upper: &[f64],
     n_particles: usize,
@@ -1100,27 +1116,32 @@ fn profile_t0_search(
 
     let run_at_t0 = |t0: f64| -> (Vec<f64>, f64) {
         let (lower, upper) = pso_bounds_no_t0(model);
+        let problem = PsoCost {
+            times: &data.times,
+            flux: &data.flux,
+            flux_err: &data.flux_err,
+            obs_var: &data.obs_var,
+            is_upper: &data.is_upper,
+            upper_flux: &data.upper_flux,
+            model,
+        };
+        let mut pred_buf = vec![0.0; data.times.len()];
+        let mut full = vec![0.0; lower.len() + 1];
         let cost_fn = |params: &[f64]| -> f64 {
-            let mut full = Vec::with_capacity(params.len() + 1);
+            // Reconstruct full params with t0 inserted
+            let mut fi = 0;
             for (i, &val) in params.iter().enumerate() {
                 if i == t0_idx {
-                    full.push(t0);
+                    full[fi] = t0;
+                    fi += 1;
                 }
-                full.push(val);
+                full[fi] = val;
+                fi += 1;
             }
             if t0_idx >= params.len() {
-                full.push(t0);
+                full[fi] = t0;
             }
-            let problem = PsoCost {
-                times: &data.times,
-                flux: &data.flux,
-                flux_err: &data.flux_err,
-                obs_var: &data.obs_var,
-                is_upper: &data.is_upper,
-                upper_flux: &data.upper_flux,
-                model,
-            };
-            problem.cost(&full).unwrap_or(1e99)
+            problem.cost_from_slice(&full, &mut pred_buf)
         };
         let (best_reduced, cost) = pso_minimize(
             cost_fn, &lower, &upper, 20, 30, 8, 42,
@@ -1188,8 +1209,9 @@ fn pso_fit_single_model(data: &BandFitData, model: SviModel) -> (SviModel, Vec<f
         upper_flux: &data.upper_flux,
         model,
     };
-    let cost_fn = |p: &[f64]| problem.cost(&p.to_vec()).unwrap_or(1e99);
-    let (params, chi2) = pso_minimize(cost_fn, &lower, &upper, 40, 50, 10, 42);
+    let mut pred_buf = vec![0.0; data.times.len()];
+    let cost_fn = |p: &[f64]| problem.cost_from_slice(p, &mut pred_buf);
+    let (params, chi2) = pso_minimize(cost_fn, &lower, &upper, 20, 50, 10, 42);
     (model, params, chi2)
 }
 

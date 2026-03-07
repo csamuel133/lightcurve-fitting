@@ -2,13 +2,11 @@ use std::collections::HashMap;
 
 use argmin::core::{CostFunction, Error as ArgminError, Executor, State};
 use argmin::solver::particleswarm::ParticleSwarm;
-use scirs2_core::ndarray::Array1;
 use serde::{Deserialize, Serialize};
-use sklears_core::traits::Predict;
-use sklears_gaussian_process::{GaussianProcessRegressor, GprTrained};
 
 use crate::common::BandData;
-use crate::gp::{fit_sklears_gp, subsample_data};
+use crate::gp::subsample_data;
+use crate::sparse_gp::DenseGP;
 
 // ---------------------------------------------------------------------------
 // Physical constants
@@ -129,14 +127,11 @@ pub struct ThermalResult {
 }
 
 // ---------------------------------------------------------------------------
-// GP fitting for reference band (lighter grid search than nonparametric)
+// GP fitting for reference band
 // ---------------------------------------------------------------------------
 
-/// Fit a GP to the reference band with a smaller grid search (3×3×2 = 18 combos).
-fn fit_ref_band_gp(
-    band_data: &BandData,
-    duration: f64,
-) -> Option<sklears_gaussian_process::GaussianProcessRegressor<GprTrained>> {
+/// Fit a DenseGP to the reference band with a grid search.
+fn fit_ref_band_gp(band_data: &BandData, duration: f64) -> Option<DenseGP> {
     let max_subsample = if band_data.times.len() <= 30 {
         band_data.times.len()
     } else {
@@ -144,64 +139,37 @@ fn fit_ref_band_gp(
     };
     let (times_sub, mags_sub, errors_sub) =
         subsample_data(&band_data.times, &band_data.values, &band_data.errors, max_subsample);
-
-    let times_arr = Array1::from_vec(times_sub);
-    let mags_arr = Array1::from_vec(mags_sub.clone());
-
-    let avg_error_var = if !errors_sub.is_empty() {
-        errors_sub.iter().map(|e| e * e).sum::<f64>() / errors_sub.len() as f64
-    } else {
-        1e-4
-    };
+    let noise_var: Vec<f64> = errors_sub.iter().map(|e| (e * e).max(1e-6)).collect();
 
     let amp_candidates = [0.1, 0.3];
     let ls_factors = [6.0, 12.0, 24.0];
-    let alpha_candidates = [avg_error_var.max(1e-6)];
 
-    let xt_sub = scirs2_core::ndarray::Array1::from_vec(band_data.times.clone())
-        .view()
-        .insert_axis(scirs2_core::ndarray::Axis(1))
-        .to_owned();
-
-    let mut best_gp = None;
+    let mut best_gp: Option<DenseGP> = None;
     let mut best_score = f64::INFINITY;
 
     for &amp in &amp_candidates {
         for &factor in &ls_factors {
             let lengthscale = (duration / factor).max(0.1);
+            if let Some(gp) = DenseGP::fit(&times_sub, &mags_sub, &noise_var, amp, lengthscale) {
+                let pred_at_obs = gp.predict(&times_sub);
+                let mut rss = 0.0f64;
+                for i in 0..mags_sub.len() {
+                    let r = mags_sub[i] - pred_at_obs[i];
+                    rss += r * r;
+                }
+                let rms = (rss / mags_sub.len() as f64).sqrt();
 
-            for &alpha in &alpha_candidates {
-                if let Some(trained) =
-                    fit_sklears_gp(&times_arr, &mags_arr, amp, lengthscale, alpha)
-                {
-                    let xt_fit = times_arr
-                        .view()
-                        .insert_axis(scirs2_core::ndarray::Axis(1))
-                        .to_owned();
-                    if let Ok(pred_at_obs) = trained.predict(&xt_fit) {
-                        let mut residuals_sq = 0.0f64;
-                        for i in 0..mags_arr.len() {
-                            let residual = mags_arr[i] - pred_at_obs[i];
-                            residuals_sq += residual * residual;
-                        }
-                        let rms = (residuals_sq / mags_arr.len() as f64).sqrt();
+                // Reject wildly extrapolating fits
+                let pred_full = gp.predict(&band_data.times);
+                let pred_min = pred_full.iter().cloned().fold(f64::INFINITY, f64::min);
+                let obs_min = mags_sub.iter().cloned().fold(f64::INFINITY, f64::min);
+                if pred_min.is_finite() && (pred_min - obs_min).abs() > 6.0 {
+                    continue;
+                }
 
-                        // Reject wildly extrapolating fits
-                        if let Ok(pred_full) = trained.predict(&xt_sub) {
-                            let pred_min =
-                                pred_full.iter().cloned().fold(f64::INFINITY, f64::min);
-                            let obs_min =
-                                mags_arr.iter().cloned().fold(f64::INFINITY, f64::min);
-                            if pred_min.is_finite() && (pred_min - obs_min).abs() > 6.0 {
-                                continue;
-                            }
-                        }
-
-                        if rms.is_finite() && rms < best_score {
-                            best_score = rms;
-                            best_gp = Some(trained);
-                        }
-                    }
+                if rms.is_finite() && rms < best_score {
+                    best_score = rms;
+                    best_gp = Some(gp);
                 }
             }
         }
@@ -220,7 +188,7 @@ fn fit_ref_band_gp(
 /// band GP is reused instead of fitting a new one.
 pub fn fit_thermal(
     bands: &HashMap<String, BandData>,
-    prefit_gps: Option<&HashMap<String, GaussianProcessRegressor<GprTrained>>>,
+    prefit_gps: Option<&HashMap<String, DenseGP>>,
 ) -> Option<ThermalResult> {
     // Choose reference band: prefer g (bluest = most temperature-sensitive)
     let ref_band_name = if bands.get("g").map_or(false, |b| b.times.len() >= 5) {
@@ -259,6 +227,7 @@ pub fn fit_thermal(
         fit_ref_band_gp(ref_data, duration)?
     };
 
+
     // Build color observations from non-reference bands
     let mut color_obs = Vec::new();
     let mut bands_used = std::collections::HashSet::new();
@@ -278,11 +247,8 @@ pub fn fit_thermal(
             let obs_err = band_data.errors[i];
 
             // Predict reference-band magnitude at this time via GP
-            let t_2d = scirs2_core::ndarray::Array2::from_shape_fn((1, 1), |_| t);
-            let ref_mag = match gp.predict(&t_2d) {
-                Ok(pred) => pred[0],
-                Err(_) => continue,
-            };
+            let ref_pred = gp.predict(&[t]);
+            let ref_mag = ref_pred[0];
 
             if !ref_mag.is_finite() {
                 continue;
@@ -291,7 +257,6 @@ pub fn fit_thermal(
             // Color = ref_mag - obs_mag (ref band minus this band)
             let observed_color = ref_mag - obs_mag;
             // Propagate error: GP uncertainty + photometric error
-            // Use photometric error as lower bound (GP uncertainty is harder to get per-point)
             let color_err = (obs_err * obs_err + 0.02 * 0.02).sqrt(); // 0.02 mag GP floor
 
             color_obs.push(ColorObs {

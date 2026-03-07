@@ -1,18 +1,41 @@
 use std::collections::HashMap;
 
-use scirs2_core::ndarray::{Array1, Array2, Axis};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use sklears_core::traits::{Fit, Predict, Untrained};
-use sklears_gaussian_process::{
-    kernels::{ConstantKernel, ProductKernel, SumKernel, WhiteKernel, RBF},
-    GaussianProcessRegressor, GprTrained, Kernel,
-};
 
 use crate::common::{
     compute_decay_rate, compute_fwhm, compute_rise_rate, extract_decay_timescale,
     extract_rise_timescale, finite_or_none, BandData,
 };
-use crate::gp::{fit_sklears_gp, subsample_data};
+use crate::gp::subsample_data;
+use crate::sparse_gp::{DenseGP, SparseGP};
+
+// ---------------------------------------------------------------------------
+// GpPredictor trait — abstracts over custom dense and sparse GP
+// ---------------------------------------------------------------------------
+
+pub(crate) trait GpPredictor: Send + Sync {
+    fn predict_times(&self, times: &[f64]) -> Option<Vec<f64>>;
+    fn predict_times_with_std(&self, times: &[f64]) -> Option<(Vec<f64>, Vec<f64>)>;
+}
+
+impl GpPredictor for DenseGP {
+    fn predict_times(&self, times: &[f64]) -> Option<Vec<f64>> {
+        Some(self.predict(times))
+    }
+    fn predict_times_with_std(&self, times: &[f64]) -> Option<(Vec<f64>, Vec<f64>)> {
+        Some(self.predict_with_std(times))
+    }
+}
+
+impl GpPredictor for SparseGP {
+    fn predict_times(&self, times: &[f64]) -> Option<Vec<f64>> {
+        Some(self.predict(times))
+    }
+    fn predict_times_with_std(&self, times: &[f64]) -> Option<(Vec<f64>, Vec<f64>)> {
+        Some(self.predict_with_std(times))
+    }
+}
 
 /// Result of nonparametric GP fitting for a single band.
 /// All f64 fields are `Option<f64>` for JSON safety (NaN → None).
@@ -73,69 +96,6 @@ pub struct NonparametricBandResult {
 }
 
 // ---------------------------------------------------------------------------
-// FastGP fallback with early-time weighting
-// ---------------------------------------------------------------------------
-
-struct FastGP {
-    base: GaussianProcessRegressor<Untrained>,
-}
-
-impl FastGP {
-    fn new(t_max: f64) -> Self {
-        let amp = 0.2;
-        let cst: Box<dyn Kernel> = Box::new(ConstantKernel::new(amp));
-        let lengthscale = (t_max / 16.0).max(0.3).min(12.0);
-        let rbf: Box<dyn Kernel> = Box::new(RBF::new(lengthscale));
-        let prod = Box::new(ProductKernel::new(vec![cst, rbf]));
-        let white = Box::new(WhiteKernel::new(1e-10));
-        let kernel = SumKernel::new(vec![prod, white]);
-
-        let base = GaussianProcessRegressor::new()
-            .kernel(Box::new(kernel))
-            .alpha(1e-10)
-            .normalize_y(true);
-
-        Self { base }
-    }
-
-    fn fit(
-        &self,
-        times: &Array1<f64>,
-        values: &Array1<f64>,
-        errors: &[f64],
-    ) -> Option<GaussianProcessRegressor<GprTrained>> {
-        let t_min = times.iter().cloned().fold(f64::INFINITY, f64::min);
-        let t_max = times.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let t_range = t_max - t_min;
-        let early_time_cutoff = t_min + 0.2 * t_range;
-
-        let weighted_errors: Vec<f64> = times
-            .iter()
-            .zip(errors.iter())
-            .map(|(t, e)| {
-                if t <= &early_time_cutoff {
-                    *e * 0.7
-                } else {
-                    *e
-                }
-            })
-            .collect();
-
-        let avg_error_var = if !weighted_errors.is_empty() {
-            weighted_errors.iter().map(|e| e * e).sum::<f64>() / weighted_errors.len() as f64
-        } else {
-            1e-4
-        };
-
-        let alpha_with_errors = avg_error_var.max(1e-5);
-        let gp_with_alpha = self.base.clone().alpha(alpha_with_errors);
-        let xt = times.view().insert_axis(Axis(1)).to_owned();
-        gp_with_alpha.fit(&xt, values).ok()
-    }
-}
-
-
-// ---------------------------------------------------------------------------
 // Predictive features
 // ---------------------------------------------------------------------------
 
@@ -185,7 +145,7 @@ fn nan_predictive_features(t0: f64, t_last: f64) -> PredictiveFeatures {
 }
 
 fn compute_predictive_features(
-    gp: &GaussianProcessRegressor<GprTrained>,
+    gp: &dyn GpPredictor,
     t_last: f64,
     t0: f64,
     times_pred: &[f64],
@@ -202,10 +162,9 @@ fn compute_predictive_features(
         t_last + 2.0 * dt,
         t_last + 3.0 * dt,
     ];
-    let xq = Array2::from_shape_fn((tq.len(), 1), |(i, _)| tq[i]);
-    let y = match gp.predict(&xq) {
-        Ok(arr) => arr.to_vec(),
-        Err(_) => return nan_predictive_features(t0, t_last),
+    let y = match gp.predict_times(&tq) {
+        Some(v) => v,
+        None => return nan_predictive_features(t0, t_last),
     };
 
     let f_m1 = y[0];
@@ -427,18 +386,14 @@ fn fit_decay_power_law(
 
 /// Predict GP magnitude at a specific time offset from peak.
 fn predict_mag_at_offset(
-    gp: &GaussianProcessRegressor<GprTrained>,
+    gp: &dyn GpPredictor,
     t_peak: f64,
     offset_days: f64,
 ) -> f64 {
     let t = t_peak + offset_days;
-    let x = Array2::from_shape_fn((1, 1), |_| t);
-    match gp.predict(&x) {
-        Ok(arr) => {
-            let v = arr[0];
-            if v.is_finite() { v } else { f64::NAN }
-        }
-        Err(_) => f64::NAN,
+    match gp.predict_times(&[t]) {
+        Some(v) if v[0].is_finite() => v[0],
+        _ => f64::NAN,
     }
 }
 
@@ -468,8 +423,7 @@ fn compute_von_neumann_ratio(times: &[f64], mags: &[f64]) -> f64 {
         .windows(2)
         .map(|w| (w[1] - w[0]).powi(2))
         .sum();
-    let eta = delta_sq / ((n - 1.0) * variance);
-    eta
+    delta_sq / ((n - 1.0) * variance)
 }
 
 /// Pre-peak baseline features from raw data.
@@ -537,13 +491,274 @@ fn compute_post_peak_monotonicity(pred: &[f64], peak_idx: usize) -> f64 {
 
 /// Fit nonparametric GP models to all bands.
 ///
-/// `bands` maps band names to `BandData` containing magnitude values.
-///
 /// Returns the per-band results and the trained GP for each band (for reuse
 /// by downstream fitters such as `fit_thermal`).
 pub fn fit_nonparametric(
     bands: &HashMap<String, BandData>,
-) -> (Vec<NonparametricBandResult>, HashMap<String, GaussianProcessRegressor<GprTrained>>) {
+) -> (Vec<NonparametricBandResult>, HashMap<String, DenseGP>) {
+    fit_nonparametric_with_opts(bands, 25)
+}
+
+/// Fit nonparametric GP models for many sources simultaneously on the GPU.
+///
+/// Each source's bands are independently fit. Returns results in the same
+/// order as the input `sources` slice.
+#[cfg(feature = "cuda")]
+pub fn fit_nonparametric_batch_gpu(
+    gpu: &crate::gpu::GpuContext,
+    sources: &[HashMap<String, BandData>],
+) -> Vec<(Vec<NonparametricBandResult>, HashMap<String, DenseGP>)> {
+    fit_nonparametric_batch_gpu_with_opts(gpu, sources, 25)
+}
+
+/// Like [`fit_nonparametric_batch_gpu`] but with configurable subsample size.
+#[cfg(feature = "cuda")]
+pub fn fit_nonparametric_batch_gpu_with_opts(
+    gpu: &crate::gpu::GpuContext,
+    sources: &[HashMap<String, BandData>],
+    max_dense_subsample: usize,
+) -> Vec<(Vec<NonparametricBandResult>, HashMap<String, DenseGP>)> {
+    use crate::gpu::GpBandInput;
+
+    if sources.is_empty() {
+        return Vec::new();
+    }
+
+    // Compute global time range across all sources
+    let mut t_min = f64::INFINITY;
+    let mut t_max = f64::NEG_INFINITY;
+    for source_bands in sources {
+        for band_data in source_bands.values() {
+            for &t in &band_data.times {
+                t_min = t_min.min(t);
+                t_max = t_max.max(t);
+            }
+        }
+    }
+    let duration = t_max - t_min;
+    if duration <= 0.0 {
+        return sources.iter().map(|_| (Vec::new(), HashMap::new())).collect();
+    }
+
+    let n_pred = 50;
+    let times_pred: Vec<f64> = (0..n_pred)
+        .map(|i| t_min + (i as f64) * duration / (n_pred - 1) as f64)
+        .collect();
+    let amp_candidates: Vec<f64> = vec![0.1, 0.3];
+    let ls_factors: &[f64] = &[6.0, 12.0, 24.0];
+    let ls_candidates: Vec<f64> = ls_factors.iter().map(|f| (duration / f).max(0.1)).collect();
+
+    // Flatten all bands from all sources into a single batch
+    struct BandMeta {
+        source_idx: usize,
+        band_name: String,
+        band_data_idx: usize,  // index into flat band_data_refs
+    }
+
+    let mut gpu_inputs: Vec<GpBandInput> = Vec::new();
+    let mut band_metas: Vec<BandMeta> = Vec::new();
+    let mut band_data_refs: Vec<&BandData> = Vec::new();
+
+    for (src_idx, source_bands) in sources.iter().enumerate() {
+        for (band_name, band_data) in source_bands {
+            if band_data.times.len() < 5 {
+                continue;
+            }
+            let noise_var: Vec<f64> = band_data.errors.iter().map(|e| (e * e).max(1e-6)).collect();
+            gpu_inputs.push(GpBandInput {
+                times: band_data.times.clone(),
+                mags: band_data.values.clone(),
+                noise_var,
+            });
+            band_metas.push(BandMeta {
+                source_idx: src_idx,
+                band_name: band_name.clone(),
+                band_data_idx: band_data_refs.len(),
+            });
+            band_data_refs.push(band_data);
+        }
+    }
+
+    if gpu_inputs.is_empty() {
+        return sources.iter().map(|_| (Vec::new(), HashMap::new())).collect();
+    }
+
+    // Launch GPU batch GP fit
+    let gpu_outputs = match gpu.batch_gp_fit(
+        &gpu_inputs, &times_pred, &amp_candidates, &ls_candidates, max_dense_subsample,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("GPU batch GP fit failed: {e}, falling back to CPU");
+            return sources.iter().map(|bands| fit_nonparametric_with_opts(bands, max_dense_subsample)).collect();
+        }
+    };
+
+    // Process GPU outputs: extract features on CPU using GPU predictions
+    let mut results: Vec<(Vec<NonparametricBandResult>, HashMap<String, DenseGP>)> =
+        sources.iter().map(|_| (Vec::new(), HashMap::new())).collect();
+
+    for (meta, gpu_out) in band_metas.iter().zip(gpu_outputs.into_iter()) {
+        let band_data = band_data_refs[meta.band_data_idx];
+        let band_name = &meta.band_name;
+
+        // Check if GPU produced valid predictions
+        let pred = &gpu_out.pred_grid;
+        let has_valid = pred.iter().any(|v| v.is_finite());
+        if !has_valid {
+            continue;
+        }
+
+        let mut std_vec = gpu_out.std_grid.clone();
+        let pred_at_obs = &gpu_out.pred_at_obs;
+
+        // Scale GP std (same logic as CPU path)
+        let rms_residual = {
+            let mut rss = 0.0;
+            for i in 0..band_data.values.len() {
+                if i < pred_at_obs.len() {
+                    let r = band_data.values[i] - pred_at_obs[i];
+                    rss += r * r;
+                }
+            }
+            (rss / band_data.values.len().max(1) as f64).sqrt()
+        };
+
+        let (sum_std, cnt_std) = std_vec.iter()
+            .filter(|s| s.is_finite())
+            .fold((0.0f64, 0usize), |(s, c), &val| (s + val, c + 1));
+        if cnt_std > 0 {
+            let mean_pred_std = sum_std / cnt_std as f64;
+            if mean_pred_std > 1e-12 && rms_residual.is_finite() {
+                let mut scale = (rms_residual / mean_pred_std).max(0.05).min(5.0);
+                scale *= 0.6;
+                for v in std_vec.iter_mut() {
+                    *v *= scale;
+                }
+            }
+        }
+
+        // Chi2 and baseline chi2
+        let mean_mag = band_data.values.iter().sum::<f64>() / band_data.values.len() as f64;
+        let mut chi2 = 0.0;
+        let mut baseline_var = 0.0;
+        for i in 0..band_data.values.len() {
+            if i < pred_at_obs.len() {
+                let residual = band_data.values[i] - pred_at_obs[i];
+                let err_sq = band_data.errors[i] * band_data.errors[i] + 1e-10;
+                chi2 += residual * residual / err_sq;
+                baseline_var += (band_data.values[i] - mean_mag).powi(2) / err_sq;
+            }
+        }
+        let chi2_reduced = chi2 / band_data.values.len().max(1) as f64;
+        let baseline_chi2 = baseline_var / band_data.values.len().max(1) as f64;
+
+        // Peak detection
+        let peak_idx = pred.iter()
+            .enumerate()
+            .filter(|(_, v)| v.is_finite())
+            .min_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let t0 = times_pred[peak_idx];
+        let peak_mag = pred[peak_idx];
+
+        let rise_time = extract_rise_timescale(&times_pred, pred, peak_idx);
+        let decay_time = extract_decay_timescale(&times_pred, pred, peak_idx);
+        let (fwhm_calc, t_before, t_after) = compute_fwhm(&times_pred, pred, peak_idx);
+        let fwhm = if !t_before.is_nan() && !t_after.is_nan() { t_after - t_before } else { fwhm_calc };
+        let rise_rate = compute_rise_rate(&times_pred, pred);
+        let decay_rate = compute_decay_rate(&times_pred, pred);
+
+        // Predictive features — need GpPredictor for point queries
+        let t_last = band_data.times.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let predictive = if let Some(ref gp) = gpu_out.dense_gp {
+            compute_predictive_features(
+                gp, t_last, t0, &times_pred, pred, &std_vec,
+                &band_data.values, &band_data.errors,
+            )
+        } else {
+            nan_predictive_features(t0, t_last)
+        };
+
+        // Decay power-law fit
+        let (pl_index, pl_chi2) = fit_decay_power_law(&times_pred, pred, &std_vec, peak_idx);
+
+        // GP predictions at fixed offsets
+        let (mag_30d, mag_60d, mag_90d) = if let Some(ref gp) = gpu_out.dense_gp {
+            (
+                predict_mag_at_offset(gp, t0, 30.0),
+                predict_mag_at_offset(gp, t0, 60.0),
+                predict_mag_at_offset(gp, t0, 90.0),
+            )
+        } else {
+            (f64::NAN, f64::NAN, f64::NAN)
+        };
+
+        // TDE vs AGN features
+        let von_neumann = compute_von_neumann_ratio(&band_data.times, &band_data.values);
+        let (pre_peak_rms, rise_over_noise) = compute_pre_peak_features(
+            &band_data.times, &band_data.values, &band_data.errors, t0, peak_mag,
+        );
+        let monotonicity = compute_post_peak_monotonicity(pred, peak_idx);
+
+        let result = NonparametricBandResult {
+            band: band_name.to_string(),
+            rise_time: finite_or_none(rise_time),
+            decay_time: finite_or_none(decay_time),
+            t0: finite_or_none(t0),
+            peak_mag: finite_or_none(peak_mag),
+            chi2: finite_or_none(chi2_reduced),
+            baseline_chi2: finite_or_none(baseline_chi2),
+            n_obs: band_data.values.len(),
+            fwhm: finite_or_none(fwhm),
+            rise_rate: finite_or_none(rise_rate),
+            decay_rate: finite_or_none(decay_rate),
+            gp_dfdt_now: finite_or_none(predictive.gp_dfdt_now),
+            gp_dfdt_next: finite_or_none(predictive.gp_dfdt_next),
+            gp_d2fdt2_now: finite_or_none(predictive.gp_d2fdt2_now),
+            gp_predicted_mag_1d: finite_or_none(predictive.gp_predicted_mag_1d),
+            gp_predicted_mag_2d: finite_or_none(predictive.gp_predicted_mag_2d),
+            gp_time_to_peak: finite_or_none(predictive.gp_time_to_peak),
+            gp_extrap_slope: finite_or_none(predictive.gp_extrap_slope),
+            gp_sigma_f: finite_or_none(predictive.gp_sigma_f),
+            gp_peak_to_peak: finite_or_none(predictive.gp_peak_to_peak),
+            gp_snr_max: finite_or_none(predictive.gp_snr_max),
+            gp_dfdt_max: finite_or_none(predictive.gp_dfdt_max),
+            gp_dfdt_min: finite_or_none(predictive.gp_dfdt_min),
+            gp_frac_of_peak: finite_or_none(predictive.gp_frac_of_peak),
+            gp_post_var_mean: finite_or_none(predictive.gp_post_var_mean),
+            gp_post_var_max: finite_or_none(predictive.gp_post_var_max),
+            gp_skewness: finite_or_none(predictive.gp_skewness),
+            gp_kurtosis: finite_or_none(predictive.gp_kurtosis),
+            gp_n_inflections: finite_or_none(predictive.gp_n_inflections),
+            decay_power_law_index: finite_or_none(pl_index),
+            decay_power_law_chi2: finite_or_none(pl_chi2),
+            mag_at_30d: finite_or_none(mag_30d),
+            mag_at_60d: finite_or_none(mag_60d),
+            mag_at_90d: finite_or_none(mag_90d),
+            von_neumann_ratio: finite_or_none(von_neumann),
+            pre_peak_rms: finite_or_none(pre_peak_rms),
+            rise_amplitude_over_noise: finite_or_none(rise_over_noise),
+            post_peak_monotonicity: finite_or_none(monotonicity),
+        };
+
+        let (ref mut src_results, ref mut src_gps) = results[meta.source_idx];
+        src_results.push(result);
+        if let Some(gp) = gpu_out.dense_gp {
+            src_gps.insert(band_name.clone(), gp);
+        }
+    }
+
+    results
+}
+
+/// Like [`fit_nonparametric`] but with configurable subsample size for the
+/// dense GP used for thermal reuse when the band has many observations.
+pub fn fit_nonparametric_with_opts(
+    bands: &HashMap<String, BandData>,
+    max_dense_subsample: usize,
+) -> (Vec<NonparametricBandResult>, HashMap<String, DenseGP>) {
     if bands.is_empty() {
         return (Vec::new(), HashMap::new());
     }
@@ -565,291 +780,296 @@ pub fn fit_nonparametric(
     let times_pred: Vec<f64> = (0..n_pred)
         .map(|i| t_min + (i as f64) * duration / (n_pred - 1) as f64)
         .collect();
-    let times_pred_arr = Array1::from_vec(times_pred.clone());
-    let times_pred_2d = times_pred_arr.view().insert_axis(Axis(1)).to_owned();
+    let amp_candidates: &[f64] = &[0.1, 0.3];
+    let ls_factors: &[f64] = &[6.0, 12.0, 24.0];
 
-    let min_points_for_independent_fit = 5;
-    let amp_candidates = vec![0.1, 0.3];
-    let ls_factors = vec![6.0, 12.0, 24.0];
+    // Process bands in parallel
+    let band_outputs: Vec<_> = bands.par_iter()
+        .filter(|(_, bd)| bd.times.len() >= 5)
+        .filter_map(|(band_name, band_data)| {
+            process_band(
+                band_name, band_data, duration, &times_pred,
+                amp_candidates, ls_factors, max_dense_subsample,
+            )
+        })
+        .collect();
 
-    let mut results = Vec::new();
-    let mut trained_gps: HashMap<String, GaussianProcessRegressor<GprTrained>> = HashMap::new();
-
-    for (band_name, band_data) in bands {
-        if band_data.times.len() < min_points_for_independent_fit {
-            continue;
-        }
-
-        let max_subsample = if band_data.times.len() <= 30 {
-            band_data.times.len()
-        } else {
-            25
-        };
-        let (times_sub, mags_sub, errors_sub) = subsample_data(
-            &band_data.times,
-            &band_data.values,
-            &band_data.errors,
-            max_subsample,
-        );
-
-        let times_arr = Array1::from_vec(times_sub);
-        let mags_arr = Array1::from_vec(mags_sub);
-
-        // Compute average error variance for alpha candidates
-        let avg_error_var = if !errors_sub.is_empty() {
-            errors_sub.iter().map(|e| e * e).sum::<f64>() / errors_sub.len() as f64
-        } else {
-            1e-4
-        };
-        let alpha_candidates = vec![avg_error_var.max(1e-6)];
-
-        // Compute minimum lengthscale from data sampling
-        let mut dt_vec: Vec<f64> = (1..times_arr.len())
-            .map(|w| times_arr[w] - times_arr[w - 1])
-            .filter(|d| d.is_finite())
-            .collect();
-        dt_vec.sort_by(|a, b| a.total_cmp(b));
-        let median_dt = if !dt_vec.is_empty() {
-            dt_vec[dt_vec.len() / 2]
-        } else {
-            1.0
-        };
-        let min_lengthscale = (median_dt * 2.0).max(0.1);
-
-        let xt_sub = times_arr.view().insert_axis(Axis(1)).to_owned();
-        let times_orig_2d = Array1::from_vec(band_data.times.clone())
-            .view()
-            .insert_axis(Axis(1))
-            .to_owned();
-
-        // Grid search over amplitude, lengthscale, and alpha
-        let mut best_gp: Option<GaussianProcessRegressor<GprTrained>> = None;
-        let mut best_score = f64::INFINITY;
-
-        for &amp in &amp_candidates {
-            for &factor in &ls_factors {
-                let lengthscale = (duration / factor).max(0.1);
-                if lengthscale < min_lengthscale {
-                    continue;
-                }
-
-                for &alpha in &alpha_candidates {
-                    if let Some(trained) =
-                        fit_sklears_gp(&times_arr, &mags_arr, amp, lengthscale, alpha)
-                    {
-                        if let Ok(pred_at_obs) = trained.predict(&xt_sub) {
-                            let mut residuals_sq = 0.0f64;
-                            for i in 0..mags_arr.len() {
-                                let residual = mags_arr[i] - pred_at_obs[i];
-                                residuals_sq += residual * residual;
-                            }
-                            let rms = (residuals_sq / mags_arr.len() as f64).sqrt();
-
-                            // Compute mean predictive std to penalize overconfident fits
-                            let mut mean_pred_std = 0.0f64;
-                            if let Ok((pred_std_obs, _)) = trained.predict_with_std(&xt_sub) {
-                                let v = pred_std_obs.to_vec();
-                                let (ssum, scnt) = v
-                                    .iter()
-                                    .filter(|s| s.is_finite())
-                                    .fold((0.0f64, 0usize), |(s, c), &val| (s + val, c + 1));
-                                if scnt > 0 {
-                                    mean_pred_std = ssum / scnt as f64;
-                                }
-                            }
-
-                            // Reject candidates with absurd extrapolated peak magnitudes
-                            if let Ok(pred_grid) = trained.predict(&times_pred_2d) {
-                                let pred_grid_min =
-                                    pred_grid.iter().cloned().fold(f64::INFINITY, f64::min);
-                                let obs_min =
-                                    mags_arr.iter().cloned().fold(f64::INFINITY, f64::min);
-                                if pred_grid_min.is_finite()
-                                    && (pred_grid_min - obs_min).abs() > 6.0
-                                {
-                                    continue;
-                                }
-                            }
-
-                            // Combined score: fit quality + uncertainty penalty
-                            let penalty_coef = 0.6_f64;
-                            let score = rms + penalty_coef * mean_pred_std;
-                            if score.is_finite() && score < best_score {
-                                best_score = score;
-                                best_gp = Some(trained);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Fallback to FastGP with early-time weighting if grid search failed
-        if best_gp.is_none() {
-            let fallback = FastGP::new(duration);
-            best_gp = fallback.fit(&times_arr, &mags_arr, &errors_sub);
-        }
-
-        if let Some(gp_fit) = best_gp {
-            trained_gps.insert(band_name.clone(), gp_fit.clone());
-            // Get spatially-varying uncertainty from predict_with_std
-            let (pred, mut std_vec) =
-                if let Ok((pred_arr, pred_std_arr)) = gp_fit.predict_with_std(&times_pred_2d) {
-                    (pred_arr.to_vec(), pred_std_arr.to_vec())
-                } else if let Ok(pred_arr) = gp_fit.predict(&times_pred_2d) {
-                    // Fallback: if predict_with_std fails, use flat uncertainty
-                    let p = pred_arr.to_vec();
-                    let s = vec![0.1; p.len()];
-                    (p, s)
-                } else {
-                    continue;
-                };
-
-            // Compute RMS residual at observed points for uncertainty rescaling
-            if let Ok(pred_at_obs_arr) = gp_fit.predict(&times_orig_2d) {
-                let pred_at_obs = pred_at_obs_arr.to_vec();
-
-                let mut residuals_sq = 0.0;
-                for i in 0..band_data.values.len() {
-                    let residual = band_data.values[i] - pred_at_obs[i];
-                    residuals_sq += residual * residual;
-                }
-                let rms_residual = (residuals_sq / band_data.values.len() as f64).sqrt();
-
-                // Scale GP std to match observed RMS with conservative shrinkage
-                if let Ok((pred_std_obs, _)) = gp_fit.predict_with_std(&times_orig_2d) {
-                    let pred_std_obs_vec = pred_std_obs.to_vec();
-                    let (sum, cnt) = pred_std_obs_vec
-                        .iter()
-                        .filter(|s| s.is_finite())
-                        .fold((0.0f64, 0usize), |(s, c), &val| (s + val, c + 1));
-                    if cnt > 0 {
-                        let mean_pred_std_obs = sum / cnt as f64;
-                        if mean_pred_std_obs > 1e-12 && rms_residual.is_finite() {
-                            let mut scale = (rms_residual / mean_pred_std_obs).max(0.05).min(5.0);
-                            scale *= 0.6; // conservative shrinkage
-                            for v in std_vec.iter_mut() {
-                                *v *= scale;
-                            }
-                        }
-                    }
-                }
-
-                // Compute chi2 and features
-                let mut chi2 = 0.0;
-                let mut baseline_var = 0.0;
-                let mean_mag = band_data.values.iter().sum::<f64>() / band_data.values.len() as f64;
-                for i in 0..band_data.values.len() {
-                    let residual = band_data.values[i] - pred_at_obs[i];
-                    let err_sq = band_data.errors[i] * band_data.errors[i] + 1e-10;
-                    chi2 += residual * residual / err_sq;
-                    baseline_var += (band_data.values[i] - mean_mag).powi(2) / err_sq;
-                }
-                let chi2_reduced = chi2 / band_data.values.len().max(1) as f64;
-                let baseline_chi2 = baseline_var / band_data.values.len().max(1) as f64;
-
-                let peak_idx = pred
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, v)| v.is_finite())
-                    .min_by(|(_, a), (_, b)| a.total_cmp(b))
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                let t0 = times_pred[peak_idx];
-                let peak_mag = pred[peak_idx];
-
-                let rise_time = extract_rise_timescale(&times_pred, &pred, peak_idx);
-                let decay_time = extract_decay_timescale(&times_pred, &pred, peak_idx);
-                let (fwhm_calc, t_before, t_after) = compute_fwhm(&times_pred, &pred, peak_idx);
-                let fwhm = if !t_before.is_nan() && !t_after.is_nan() {
-                    t_after - t_before
-                } else {
-                    fwhm_calc
-                };
-                let rise_rate = compute_rise_rate(&times_pred, &pred);
-                let decay_rate = compute_decay_rate(&times_pred, &pred);
-
-                let t_last = band_data
-                    .times
-                    .iter()
-                    .copied()
-                    .fold(f64::NEG_INFINITY, f64::max);
-                let predictive = compute_predictive_features(
-                    &gp_fit,
-                    t_last,
-                    t0,
-                    &times_pred,
-                    &pred,
-                    &std_vec,
-                    &band_data.values,
-                    &band_data.errors,
-                );
-
-                // Decay power-law fit
-                let (pl_index, pl_chi2) =
-                    fit_decay_power_law(&times_pred, &pred, &std_vec, peak_idx);
-
-                // GP predictions at fixed offsets from peak
-                let mag_30d = predict_mag_at_offset(&gp_fit, t0, 30.0);
-                let mag_60d = predict_mag_at_offset(&gp_fit, t0, 60.0);
-                let mag_90d = predict_mag_at_offset(&gp_fit, t0, 90.0);
-
-                // TDE vs AGN variability features
-                let von_neumann = compute_von_neumann_ratio(
-                    &band_data.times, &band_data.values,
-                );
-                let (pre_peak_rms, rise_over_noise) = compute_pre_peak_features(
-                    &band_data.times,
-                    &band_data.values,
-                    &band_data.errors,
-                    t0,
-                    peak_mag,
-                );
-                let monotonicity = compute_post_peak_monotonicity(&pred, peak_idx);
-
-                results.push(NonparametricBandResult {
-                    band: band_name.clone(),
-                    rise_time: finite_or_none(rise_time),
-                    decay_time: finite_or_none(decay_time),
-                    t0: finite_or_none(t0),
-                    peak_mag: finite_or_none(peak_mag),
-                    chi2: finite_or_none(chi2_reduced),
-                    baseline_chi2: finite_or_none(baseline_chi2),
-                    n_obs: band_data.values.len(),
-                    fwhm: finite_or_none(fwhm),
-                    rise_rate: finite_or_none(rise_rate),
-                    decay_rate: finite_or_none(decay_rate),
-                    gp_dfdt_now: finite_or_none(predictive.gp_dfdt_now),
-                    gp_dfdt_next: finite_or_none(predictive.gp_dfdt_next),
-                    gp_d2fdt2_now: finite_or_none(predictive.gp_d2fdt2_now),
-                    gp_predicted_mag_1d: finite_or_none(predictive.gp_predicted_mag_1d),
-                    gp_predicted_mag_2d: finite_or_none(predictive.gp_predicted_mag_2d),
-                    gp_time_to_peak: finite_or_none(predictive.gp_time_to_peak),
-                    gp_extrap_slope: finite_or_none(predictive.gp_extrap_slope),
-                    gp_sigma_f: finite_or_none(predictive.gp_sigma_f),
-                    gp_peak_to_peak: finite_or_none(predictive.gp_peak_to_peak),
-                    gp_snr_max: finite_or_none(predictive.gp_snr_max),
-                    gp_dfdt_max: finite_or_none(predictive.gp_dfdt_max),
-                    gp_dfdt_min: finite_or_none(predictive.gp_dfdt_min),
-                    gp_frac_of_peak: finite_or_none(predictive.gp_frac_of_peak),
-                    gp_post_var_mean: finite_or_none(predictive.gp_post_var_mean),
-                    gp_post_var_max: finite_or_none(predictive.gp_post_var_max),
-                    gp_skewness: finite_or_none(predictive.gp_skewness),
-                    gp_kurtosis: finite_or_none(predictive.gp_kurtosis),
-                    gp_n_inflections: finite_or_none(predictive.gp_n_inflections),
-                    decay_power_law_index: finite_or_none(pl_index),
-                    decay_power_law_chi2: finite_or_none(pl_chi2),
-                    mag_at_30d: finite_or_none(mag_30d),
-                    mag_at_60d: finite_or_none(mag_60d),
-                    mag_at_90d: finite_or_none(mag_90d),
-                    von_neumann_ratio: finite_or_none(von_neumann),
-                    pre_peak_rms: finite_or_none(pre_peak_rms),
-                    rise_amplitude_over_noise: finite_or_none(rise_over_noise),
-                    post_peak_monotonicity: finite_or_none(monotonicity),
-                });
-            }
+    let mut results = Vec::with_capacity(band_outputs.len());
+    let mut trained_gps: HashMap<String, DenseGP> = HashMap::new();
+    for (result, gp_opt) in band_outputs {
+        results.push(result);
+        if let Some((name, gp)) = gp_opt {
+            trained_gps.insert(name, gp);
         }
     }
 
     (results, trained_gps)
+}
+
+/// Process a single band: fit GP, extract features, and build a DenseGP for thermal reuse.
+fn process_band(
+    band_name: &str,
+    band_data: &BandData,
+    duration: f64,
+    times_pred: &[f64],
+    amp_candidates: &[f64],
+    ls_factors: &[f64],
+    max_dense_subsample: usize,
+) -> Option<(NonparametricBandResult, Option<(String, DenseGP)>)> {
+    let n_obs = band_data.times.len();
+
+    // Compute minimum lengthscale from data sampling
+    let mut sorted_times = band_data.times.clone();
+    sorted_times.sort_by(|a, b| a.total_cmp(b));
+    let mut dt_vec: Vec<f64> = (1..sorted_times.len())
+        .map(|w| sorted_times[w] - sorted_times[w - 1])
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .collect();
+    dt_vec.sort_by(|a, b| a.total_cmp(b));
+    let median_dt = if !dt_vec.is_empty() {
+        dt_vec[dt_vec.len() / 2]
+    } else {
+        1.0
+    };
+    let min_lengthscale = (median_dt * 2.0).max(0.1);
+
+    // ---------------------------------------------------------------
+    // Fit GP: sparse for large n, dense for small n
+    // ---------------------------------------------------------------
+    let use_sparse = n_obs > 100;
+    let gp_predictor: Box<dyn GpPredictor>;
+    let mut thermal_gp: Option<(String, DenseGP)> = None;
+    let noise_var: Vec<f64> = band_data.errors.iter().map(|e| (e * e).max(1e-6)).collect();
+
+    if use_sparse {
+        // Sparse GP (FITC) — uses ALL observations
+        let m_inducing = 30.min(n_obs);
+
+        let mut best_sparse: Option<SparseGP> = None;
+        let mut best_score = f64::INFINITY;
+
+        for &amp in amp_candidates {
+            for &factor in ls_factors {
+                let lengthscale = (duration / factor).max(0.1);
+                if lengthscale < min_lengthscale { continue; }
+                if let Some(sgp) = SparseGP::fit(
+                    &band_data.times, &band_data.values, &noise_var,
+                    amp, lengthscale, m_inducing,
+                ) {
+                    let score = sgp.approx_nlml(
+                        &band_data.times, &band_data.values, &noise_var,
+                    );
+                    if score.is_finite() && score < best_score {
+                        best_score = score;
+                        best_sparse = Some(sgp);
+                    }
+                }
+            }
+        }
+
+        gp_predictor = Box::new(best_sparse?);
+
+        // Fit a DenseGP on subsampled data for thermal reuse
+        let (times_sub, mags_sub, errs_sub) = subsample_data(
+            &band_data.times, &band_data.values, &band_data.errors, max_dense_subsample,
+        );
+        let nv_sub: Vec<f64> = errs_sub.iter().map(|e| (e * e).max(1e-6)).collect();
+        'outer_sparse: for &amp in amp_candidates {
+            for &factor in ls_factors {
+                let ls = (duration / factor).max(0.1);
+                if let Some(dgp) = DenseGP::fit(&times_sub, &mags_sub, &nv_sub, amp, ls) {
+                    thermal_gp = Some((band_name.to_string(), dgp));
+                    break 'outer_sparse;
+                }
+            }
+        }
+    } else {
+        // Custom dense GP — fits on all data (n ≤ 200)
+        let mut best_dense: Option<DenseGP> = None;
+        let mut best_score = f64::INFINITY;
+
+        for &amp in amp_candidates {
+            for &factor in ls_factors {
+                let lengthscale = (duration / factor).max(0.1);
+                if lengthscale < min_lengthscale { continue; }
+                if let Some(dgp) = DenseGP::fit(
+                    &band_data.times, &band_data.values, &noise_var,
+                    amp, lengthscale,
+                ) {
+                    let rms = dgp.train_rms(&band_data.values);
+                    if rms.is_finite() && rms < best_score {
+                        best_score = rms;
+                        best_dense = Some(dgp);
+                    }
+                }
+            }
+        }
+
+        let dgp = best_dense?;
+        thermal_gp = Some((band_name.to_string(), dgp.clone()));
+        gp_predictor = Box::new(dgp);
+    };
+
+    // ---------------------------------------------------------------
+    // Feature extraction (unified for both GP types via GpPredictor)
+    // ---------------------------------------------------------------
+    let (pred, mut std_vec) =
+        if let Some((p, s)) = gp_predictor.predict_times_with_std(times_pred) {
+            (p, s)
+        } else if let Some(p) = gp_predictor.predict_times(times_pred) {
+            let s = vec![0.1; p.len()];
+            (p, s)
+        } else {
+            return None;
+        };
+
+    let pred_at_obs = gp_predictor.predict_times(&band_data.times)?;
+
+    let mut residuals_sq = 0.0;
+    for i in 0..band_data.values.len() {
+        let residual = band_data.values[i] - pred_at_obs[i];
+        residuals_sq += residual * residual;
+    }
+    let rms_residual = (residuals_sq / band_data.values.len() as f64).sqrt();
+
+    // Scale GP std: use a subsample for uncertainty estimation
+    let max_for_std = 200;
+    let std_sample_times = if band_data.times.len() > max_for_std {
+        let step = band_data.times.len() as f64 / max_for_std as f64;
+        (0..max_for_std)
+            .map(|i| band_data.times[((i as f64 + 0.5) * step) as usize])
+            .collect::<Vec<_>>()
+    } else {
+        band_data.times.clone()
+    };
+
+    if let Some((_, std_at_sample)) = gp_predictor.predict_times_with_std(&std_sample_times) {
+        let (sum, cnt) = std_at_sample
+            .iter()
+            .filter(|s| s.is_finite())
+            .fold((0.0f64, 0usize), |(s, c), &val| (s + val, c + 1));
+        if cnt > 0 {
+            let mean_pred_std_obs = sum / cnt as f64;
+            if mean_pred_std_obs > 1e-12 && rms_residual.is_finite() {
+                let mut scale = (rms_residual / mean_pred_std_obs).max(0.05).min(5.0);
+                scale *= 0.6; // conservative shrinkage
+                for v in std_vec.iter_mut() {
+                    *v *= scale;
+                }
+            }
+        }
+    }
+
+    // Compute chi2 and features
+    let mut chi2 = 0.0;
+    let mut baseline_var = 0.0;
+    let mean_mag = band_data.values.iter().sum::<f64>() / band_data.values.len() as f64;
+    for i in 0..band_data.values.len() {
+        let residual = band_data.values[i] - pred_at_obs[i];
+        let err_sq = band_data.errors[i] * band_data.errors[i] + 1e-10;
+        chi2 += residual * residual / err_sq;
+        baseline_var += (band_data.values[i] - mean_mag).powi(2) / err_sq;
+    }
+    let chi2_reduced = chi2 / band_data.values.len().max(1) as f64;
+    let baseline_chi2 = baseline_var / band_data.values.len().max(1) as f64;
+
+    let peak_idx = pred
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.is_finite())
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let t0 = times_pred[peak_idx];
+    let peak_mag = pred[peak_idx];
+
+    let rise_time = extract_rise_timescale(times_pred, &pred, peak_idx);
+    let decay_time = extract_decay_timescale(times_pred, &pred, peak_idx);
+    let (fwhm_calc, t_before, t_after) = compute_fwhm(times_pred, &pred, peak_idx);
+    let fwhm = if !t_before.is_nan() && !t_after.is_nan() {
+        t_after - t_before
+    } else {
+        fwhm_calc
+    };
+    let rise_rate = compute_rise_rate(times_pred, &pred);
+    let decay_rate = compute_decay_rate(times_pred, &pred);
+
+    let t_last = band_data
+        .times
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let predictive = compute_predictive_features(
+        gp_predictor.as_ref(),
+        t_last,
+        t0,
+        times_pred,
+        &pred,
+        &std_vec,
+        &band_data.values,
+        &band_data.errors,
+    );
+
+    // Decay power-law fit
+    let (pl_index, pl_chi2) =
+        fit_decay_power_law(times_pred, &pred, &std_vec, peak_idx);
+
+    // GP predictions at fixed offsets from peak
+    let mag_30d = predict_mag_at_offset(gp_predictor.as_ref(), t0, 30.0);
+    let mag_60d = predict_mag_at_offset(gp_predictor.as_ref(), t0, 60.0);
+    let mag_90d = predict_mag_at_offset(gp_predictor.as_ref(), t0, 90.0);
+
+    // TDE vs AGN variability features
+    let von_neumann = compute_von_neumann_ratio(&band_data.times, &band_data.values);
+    let (pre_peak_rms, rise_over_noise) = compute_pre_peak_features(
+        &band_data.times,
+        &band_data.values,
+        &band_data.errors,
+        t0,
+        peak_mag,
+    );
+    let monotonicity = compute_post_peak_monotonicity(&pred, peak_idx);
+
+    let result = NonparametricBandResult {
+        band: band_name.to_string(),
+        rise_time: finite_or_none(rise_time),
+        decay_time: finite_or_none(decay_time),
+        t0: finite_or_none(t0),
+        peak_mag: finite_or_none(peak_mag),
+        chi2: finite_or_none(chi2_reduced),
+        baseline_chi2: finite_or_none(baseline_chi2),
+        n_obs: band_data.values.len(),
+        fwhm: finite_or_none(fwhm),
+        rise_rate: finite_or_none(rise_rate),
+        decay_rate: finite_or_none(decay_rate),
+        gp_dfdt_now: finite_or_none(predictive.gp_dfdt_now),
+        gp_dfdt_next: finite_or_none(predictive.gp_dfdt_next),
+        gp_d2fdt2_now: finite_or_none(predictive.gp_d2fdt2_now),
+        gp_predicted_mag_1d: finite_or_none(predictive.gp_predicted_mag_1d),
+        gp_predicted_mag_2d: finite_or_none(predictive.gp_predicted_mag_2d),
+        gp_time_to_peak: finite_or_none(predictive.gp_time_to_peak),
+        gp_extrap_slope: finite_or_none(predictive.gp_extrap_slope),
+        gp_sigma_f: finite_or_none(predictive.gp_sigma_f),
+        gp_peak_to_peak: finite_or_none(predictive.gp_peak_to_peak),
+        gp_snr_max: finite_or_none(predictive.gp_snr_max),
+        gp_dfdt_max: finite_or_none(predictive.gp_dfdt_max),
+        gp_dfdt_min: finite_or_none(predictive.gp_dfdt_min),
+        gp_frac_of_peak: finite_or_none(predictive.gp_frac_of_peak),
+        gp_post_var_mean: finite_or_none(predictive.gp_post_var_mean),
+        gp_post_var_max: finite_or_none(predictive.gp_post_var_max),
+        gp_skewness: finite_or_none(predictive.gp_skewness),
+        gp_kurtosis: finite_or_none(predictive.gp_kurtosis),
+        gp_n_inflections: finite_or_none(predictive.gp_n_inflections),
+        decay_power_law_index: finite_or_none(pl_index),
+        decay_power_law_chi2: finite_or_none(pl_chi2),
+        mag_at_30d: finite_or_none(mag_30d),
+        mag_at_60d: finite_or_none(mag_60d),
+        mag_at_90d: finite_or_none(mag_90d),
+        von_neumann_ratio: finite_or_none(von_neumann),
+        pre_peak_rms: finite_or_none(pre_peak_rms),
+        rise_amplitude_over_noise: finite_or_none(rise_over_noise),
+        post_peak_monotonicity: finite_or_none(monotonicity),
+    };
+
+    Some((result, thermal_gp))
 }

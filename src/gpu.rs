@@ -134,6 +134,38 @@ extern "C" {
     fn launch_metzger_kn(p: *const f64, t: *const f64, o: *mut f64, nd: c_int, nt: c_int, np: c_int, grid: c_int, block: c_int);
 }
 
+// Batch GP fit + predict launchers
+extern "C" {
+    fn launch_batch_gp_fit_predict(
+        all_times: *const f64,
+        all_mags: *const f64,
+        all_noise_var: *const f64,
+        band_offsets: *const c_int,
+        query_times: *const f64,
+        hp_amps: *const f64,
+        hp_ls: *const f64,
+        gp_state: *mut f64,
+        pred_grid: *mut f64,
+        std_grid: *mut f64,
+        n_bands: c_int,
+        n_hp_amp: c_int,
+        n_hp_ls: c_int,
+        max_subsample: c_int,
+        grid: c_int,
+        block: c_int,
+    );
+
+    fn launch_batch_gp_predict_obs(
+        gp_state: *const f64,
+        all_times: *const f64,
+        obs_to_band: *const c_int,
+        pred_obs: *mut f64,
+        total_obs: c_int,
+        grid: c_int,
+        block: c_int,
+    );
+}
+
 // Batch PSO cost launcher
 extern "C" {
     fn launch_batch_pso_cost(
@@ -567,4 +599,207 @@ impl GpuContext {
 
         Ok(best_model.into_iter().zip(best_result).collect())
     }
+
+    // -----------------------------------------------------------------------
+    // Batch GP fitting
+    // -----------------------------------------------------------------------
+
+    /// Fit DenseGPs for many bands in parallel on the GPU.
+    ///
+    /// Each band is independently subsampled, hyperparameter-searched, and
+    /// predicted at `query_times` (shared grid) plus at its own observation
+    /// points.
+    ///
+    /// Returns one `GpBandOutput` per input band.
+    pub fn batch_gp_fit(
+        &self,
+        bands: &[GpBandInput],
+        query_times: &[f64],
+        amp_candidates: &[f64],
+        ls_candidates: &[f64],
+        max_subsample: usize,
+    ) -> Result<Vec<GpBandOutput>, String> {
+        use crate::sparse_gp::DenseGP;
+
+        let n_bands = bands.len();
+        if n_bands == 0 {
+            return Ok(Vec::new());
+        }
+
+        let n_pred = query_times.len();
+        assert!(n_pred == 50, "batch_gp_fit expects 50 query points");
+
+        // Pack band data into concatenated arrays + offset table
+        let mut all_times = Vec::new();
+        let mut all_mags = Vec::new();
+        let mut all_noise_var = Vec::new();
+        let mut offsets: Vec<c_int> = Vec::with_capacity(n_bands + 1);
+        let mut obs_to_band: Vec<c_int> = Vec::new();
+        offsets.push(0);
+
+        for (b, band) in bands.iter().enumerate() {
+            all_times.extend_from_slice(&band.times);
+            all_mags.extend_from_slice(&band.mags);
+            all_noise_var.extend_from_slice(&band.noise_var);
+            obs_to_band.extend(std::iter::repeat(b as c_int).take(band.times.len()));
+            offsets.push(all_times.len() as c_int);
+        }
+
+        let total_obs = all_times.len();
+        let gp_state_size = 54; // GP_STATE_SIZE in CUDA
+
+        // Upload inputs to GPU
+        let d_times = DevBuf::upload(&all_times)?;
+        let d_mags = DevBuf::upload(&all_mags)?;
+        let d_noise_var = DevBuf::upload(&all_noise_var)?;
+        let d_offsets = DevBuf::upload(&offsets)?;
+        let d_query = DevBuf::upload(query_times)?;
+        let d_amps = DevBuf::upload(amp_candidates)?;
+        let d_ls = DevBuf::upload(ls_candidates)?;
+
+        // Allocate outputs
+        let d_gp_state = DevBuf::alloc(n_bands * gp_state_size * size_of::<f64>())?;
+        let d_pred_grid = DevBuf::alloc(n_bands * n_pred * size_of::<f64>())?;
+        let d_std_grid = DevBuf::alloc(n_bands * n_pred * size_of::<f64>())?;
+
+        // Launch kernel 1: fit + predict at grid
+        // One block per band, blockDim = n_hp_total (threads per block = hyperparameter combos)
+        let n_hp_total = amp_candidates.len() * ls_candidates.len();
+        let block: c_int = n_hp_total as c_int;
+        let grid: c_int = n_bands as c_int;
+
+        unsafe {
+            launch_batch_gp_fit_predict(
+                d_times.ptr as _, d_mags.ptr as _, d_noise_var.ptr as _,
+                d_offsets.ptr as _, d_query.ptr as _,
+                d_amps.ptr as _, d_ls.ptr as _,
+                d_gp_state.ptr as _, d_pred_grid.ptr as _, d_std_grid.ptr as _,
+                n_bands as c_int,
+                amp_candidates.len() as c_int,
+                ls_candidates.len() as c_int,
+                max_subsample as c_int,
+                grid, block,
+            );
+            cuda_check(cudaGetLastError())?;
+            cuda_check(cudaDeviceSynchronize())?;
+        }
+
+        // Launch kernel 2: predict at observation points
+        let d_obs_to_band = DevBuf::upload(&obs_to_band)?;
+        let d_pred_obs = DevBuf::alloc(total_obs * size_of::<f64>())?;
+
+        let block2: c_int = 256;
+        let grid2: c_int = (total_obs as c_int + block2 - 1) / block2;
+
+        unsafe {
+            launch_batch_gp_predict_obs(
+                d_gp_state.ptr as _, d_times.ptr as _,
+                d_obs_to_band.ptr as _, d_pred_obs.ptr as _,
+                total_obs as c_int, grid2, block2,
+            );
+            cuda_check(cudaGetLastError())?;
+            cuda_check(cudaDeviceSynchronize())?;
+        }
+
+        // Download results
+        let mut h_gp_state = vec![0.0f64; n_bands * gp_state_size];
+        let mut h_pred_grid = vec![0.0f64; n_bands * n_pred];
+        let mut h_std_grid = vec![0.0f64; n_bands * n_pred];
+        let mut h_pred_obs = vec![0.0f64; total_obs];
+
+        d_gp_state.download_into(&mut h_gp_state)?;
+        d_pred_grid.download_into(&mut h_pred_grid)?;
+        d_std_grid.download_into(&mut h_std_grid)?;
+        d_pred_obs.download_into(&mut h_pred_obs)?;
+
+        // Build output structs
+        let mut results = Vec::with_capacity(n_bands);
+        let mut obs_offset = 0usize;
+
+        for b in 0..n_bands {
+            let state_off = b * gp_state_size;
+            let state = &h_gp_state[state_off..state_off + gp_state_size];
+            let m = state[53] as usize;
+            let n_obs_band = bands[b].times.len();
+
+            let pred_grid_slice = &h_pred_grid[b * n_pred..(b + 1) * n_pred];
+            let std_grid_slice = &h_std_grid[b * n_pred..(b + 1) * n_pred];
+            let pred_obs_slice = &h_pred_obs[obs_offset..obs_offset + n_obs_band];
+            obs_offset += n_obs_band;
+
+            // Reconstruct DenseGP on CPU
+            let dense_gp = if m > 0 && m <= 25 {
+                let x_train = state[25..25 + m].to_vec();
+                let amp = state[50];
+                let inv_2ls2 = state[51];
+
+                // Reconstruct the Cholesky factor by re-fitting on CPU
+                // (cheaper than transferring m×m matrix from GPU)
+                let sub_nv: Vec<f64> = {
+                    let n_obs = bands[b].times.len();
+                    if n_obs <= m {
+                        bands[b].noise_var.clone()
+                    } else {
+                        let step = (n_obs - 1) as f64 / (m - 1) as f64;
+                        (0..m).map(|i| {
+                            let idx = (i as f64 * step + 0.5) as usize;
+                            bands[b].noise_var[idx.min(n_obs - 1)]
+                        }).collect()
+                    }
+                };
+
+                DenseGP::fit(&x_train, &{
+                    // Recover subsampled values: y = alpha solved from (K+noise)^{-1}(y-ymean)
+                    // Easier: just re-fit with same hyperparams
+                    let sub_v: Vec<f64> = {
+                        let n_obs = bands[b].times.len();
+                        if n_obs <= m {
+                            bands[b].mags.clone()
+                        } else {
+                            let step = (n_obs - 1) as f64 / (m - 1) as f64;
+                            (0..m).map(|i| {
+                                let idx = (i as f64 * step + 0.5) as usize;
+                                bands[b].mags[idx.min(n_obs - 1)]
+                            }).collect()
+                        }
+                    };
+                    sub_v
+                }, &sub_nv, amp, (0.5 / inv_2ls2).sqrt())
+            } else {
+                None
+            };
+
+            results.push(GpBandOutput {
+                dense_gp,
+                pred_grid: pred_grid_slice.to_vec(),
+                std_grid: std_grid_slice.to_vec(),
+                pred_at_obs: pred_obs_slice.to_vec(),
+            });
+        }
+
+        Ok(results)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batch GP types
+// ---------------------------------------------------------------------------
+
+/// Input data for one band in batch GP fitting.
+pub struct GpBandInput {
+    pub times: Vec<f64>,
+    pub mags: Vec<f64>,
+    pub noise_var: Vec<f64>,
+}
+
+/// Output of GPU GP fitting for one band.
+pub struct GpBandOutput {
+    /// Reconstructed DenseGP for additional predictions (thermal reuse, etc.)
+    pub dense_gp: Option<crate::sparse_gp::DenseGP>,
+    /// Mean predictions at the shared grid points (50 points).
+    pub pred_grid: Vec<f64>,
+    /// Std predictions at the shared grid points.
+    pub std_grid: Vec<f64>,
+    /// Mean predictions at the band's observation points (for chi2).
+    pub pred_at_obs: Vec<f64>,
 }

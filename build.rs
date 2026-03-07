@@ -10,11 +10,13 @@ fn build_cuda() {
         .flag("-gencode=arch=compute_90,code=sm_90")  // Hopper (H100)
         .flag("-Wno-deprecated-gpu-targets")
         .file("cuda/models.cu")
+        .file("cuda/gp.cu")
         .compile("lightcurve_cuda");
 
     // Link against the CUDA runtime
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rerun-if-changed=cuda/models.cu");
+    println!("cargo:rerun-if-changed=cuda/gp.cu");
 }
 
 fn main() {

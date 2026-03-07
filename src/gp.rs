@@ -1,32 +1,4 @@
-use scirs2_core::ndarray::{Array1, Axis};
-use sklears_core::traits::Fit;
-use sklears_gaussian_process::{
-    kernels::{ConstantKernel, ProductKernel, SumKernel, WhiteKernel, RBF},
-    GaussianProcessRegressor, GprTrained, Kernel,
-};
-
-/// Fit a GP with the given amplitude, lengthscale, and alpha parameters.
-pub fn fit_sklears_gp(
-    times: &Array1<f64>,
-    values: &Array1<f64>,
-    amp: f64,
-    lengthscale: f64,
-    alpha: f64,
-) -> Option<GaussianProcessRegressor<GprTrained>> {
-    let cst: Box<dyn Kernel> = Box::new(ConstantKernel::new(amp));
-    let rbf: Box<dyn Kernel> = Box::new(RBF::new(lengthscale));
-    let prod = Box::new(ProductKernel::new(vec![cst, rbf]));
-    let white = Box::new(WhiteKernel::new(1e-10));
-    let kernel = SumKernel::new(vec![prod, white]);
-
-    let gp = GaussianProcessRegressor::new()
-        .kernel(Box::new(kernel))
-        .alpha(alpha)
-        .normalize_y(true);
-
-    let xt = times.view().insert_axis(Axis(1)).to_owned();
-    gp.fit(&xt, values).ok()
-}
+use crate::sparse_gp::DenseGP;
 
 /// Subsample data to at most `max_points` by uniform striding.
 pub fn subsample_data(
@@ -51,4 +23,40 @@ pub fn subsample_data(
     let errors_sub: Vec<f64> = indices.iter().map(|&i| errors[i]).collect();
 
     (times_sub, mags_sub, errors_sub)
+}
+
+/// Fit a GP to training data and predict at query points.
+///
+/// Does a grid search over amplitude and lengthscale, using measurement
+/// error variance as noise. Returns predictions at `query_times`.
+///
+/// Returns `(predictions, std_devs)` or None if fitting fails.
+pub fn fit_gp_predict(
+    train_times: &[f64],
+    train_values: &[f64],
+    train_errors: &[f64],
+    query_times: &[f64],
+    amp_candidates: &[f64],
+    ls_candidates: &[f64],
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    let noise_var: Vec<f64> = train_errors.iter().map(|e| (e * e).max(1e-6)).collect();
+
+    let mut best_gp: Option<DenseGP> = None;
+    let mut best_score = f64::INFINITY;
+
+    for &amp in amp_candidates {
+        for &ls in ls_candidates {
+            if let Some(gp) = DenseGP::fit(train_times, train_values, &noise_var, amp, ls) {
+                let rms = gp.train_rms(train_values);
+                if rms.is_finite() && rms < best_score {
+                    best_score = rms;
+                    best_gp = Some(gp);
+                }
+            }
+        }
+    }
+
+    let gp = best_gp?;
+    let (pred, std) = gp.predict_with_std(query_times);
+    Some((pred, std))
 }
