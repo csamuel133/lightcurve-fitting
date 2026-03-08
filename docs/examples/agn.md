@@ -97,4 +97,3 @@ for r in param_results:
 ```
 
 ![NP fit](../img/np_agn.png)
-![Parametric fit](../img/param_agn.png)

@@ -105,10 +105,6 @@ Both methods are followed by a profile-likelihood refinement of the t0
 
 ![TDE parametric fit](../img/param_tde.png)
 
-![AGN parametric fit](../img/param_agn.png)
-
-![Cataclysmic variable parametric fit](../img/param_cataclysmic.png)
-
 ## Python Usage
 
 ```python
