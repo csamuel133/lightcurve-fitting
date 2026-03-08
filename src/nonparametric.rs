@@ -139,6 +139,9 @@ pub struct NonparametricBandResult {
     /// Fraction of consecutive post-peak GP predictions where mag increases (fading).
     /// ~1.0 for TDEs (monotonic decay), ~0.5 for stochastic AGN.
     pub post_peak_monotonicity: Option<f64>,
+    /// Number of distinct brightness peaks (GP magnitude local minima).
+    /// SNe: 1, CVs: 2+ (multiple outbursts), AGN: variable.
+    pub n_local_maxima: Option<f64>,
     /// Number of upper-limit observations (flux SNR < 3) excluded from GP training.
     pub n_upper_limits: usize,
     /// Best-fit GP kernel amplitude (σ² in RBF kernel).
@@ -207,6 +210,7 @@ fn compute_predictive_features(
     obs_errors: &[f64],
 ) -> PredictiveFeatures {
     let dt = 1.0;
+    // Query points for forward predictions
     let tq = vec![
         t_last - dt,
         t_last,
@@ -224,6 +228,28 @@ fn compute_predictive_features(
     let f_p1 = y[2];
     let f_p2 = y[3];
     let f_p3 = y[4];
+
+    // Smoothed derivative: average GP slope over a 5-day window centred on t_last.
+    // Uses 6 query points at 1-day spacing [t-2, t-1, t, t+1, t+2, t+3] to get
+    // 5 finite differences, then averages them. Much more stable than a single-
+    // point difference as alerts accumulate.
+    let gp_dfdt_now_smooth = {
+        let window_pts: Vec<f64> = (-2..=3).map(|i| t_last + i as f64).collect();
+        match gp.predict_times(&window_pts) {
+            Some(yw) if yw.len() == 6 => {
+                let slopes: Vec<f64> = (0..5)
+                    .map(|i| yw[i + 1] - yw[i]) // dt=1 so slope = diff
+                    .filter(|s| s.is_finite())
+                    .collect();
+                if slopes.is_empty() {
+                    f64::NAN
+                } else {
+                    slopes.iter().sum::<f64>() / slopes.len() as f64
+                }
+            }
+            _ => (f_0 - f_m1) / dt, // fallback to single-point
+        }
+    };
 
     // Variability strength
     let gp_sigma_f = if !pred.is_empty() {
@@ -341,7 +367,7 @@ fn compute_predictive_features(
     };
 
     PredictiveFeatures {
-        gp_dfdt_now: (f_0 - f_m1) / dt,
+        gp_dfdt_now: gp_dfdt_now_smooth,
         gp_dfdt_next: (f_p1 - f_0) / dt,
         gp_d2fdt2_now: (f_p1 - 2.0 * f_0 + f_m1) / (dt * dt),
         gp_predicted_mag_1d: f_p1,
@@ -612,6 +638,38 @@ fn compute_pre_peak_features(
     (rms, rise_sig)
 }
 
+/// Count distinct local brightness maxima (magnitude minima) in the GP prediction.
+///
+/// A local max is a point brighter than both neighbours by at least `threshold` mag.
+/// CVs typically show multiple outbursts (n >= 2), while SNe have exactly 1.
+fn count_local_maxima(pred: &[f64], threshold: f64) -> usize {
+    if pred.len() < 3 {
+        return if pred.is_empty() { 0 } else { 1 };
+    }
+    let mut count = 0;
+    for i in 1..pred.len() - 1 {
+        if !pred[i].is_finite() || !pred[i - 1].is_finite() || !pred[i + 1].is_finite() {
+            continue;
+        }
+        // In magnitude space, brighter = lower value, so a local brightness max
+        // is a local minimum in mag.
+        if pred[i] < pred[i - 1] - threshold && pred[i] < pred[i + 1] - threshold {
+            count += 1;
+        }
+    }
+    // Check endpoints
+    if pred.len() >= 2 {
+        if pred[0].is_finite() && pred[1].is_finite() && pred[0] < pred[1] - threshold {
+            count += 1;
+        }
+        let n = pred.len();
+        if pred[n - 1].is_finite() && pred[n - 2].is_finite() && pred[n - 1] < pred[n - 2] - threshold {
+            count += 1;
+        }
+    }
+    count.max(1) // at least 1 if we have data
+}
+
 /// Fraction of consecutive post-peak GP predictions where mag increases (fading).
 fn compute_post_peak_monotonicity(pred: &[f64], peak_idx: usize) -> f64 {
     if peak_idx >= pred.len().saturating_sub(2) {
@@ -864,6 +922,7 @@ pub fn fit_nonparametric_batch_gpu_with_opts(
             &band_data.times, &band_data.values, &band_data.errors, t0, peak_mag,
         );
         let monotonicity = compute_post_peak_monotonicity(pred, peak_idx);
+        let n_local_maxima = count_local_maxima(pred, 0.1);
 
         let result = NonparametricBandResult {
             band: band_name.to_string(),
@@ -910,6 +969,7 @@ pub fn fit_nonparametric_batch_gpu_with_opts(
             pre_peak_rms: finite_or_none(pre_peak_rms),
             rise_amplitude_over_noise: finite_or_none(rise_over_noise),
             post_peak_monotonicity: finite_or_none(monotonicity),
+            n_local_maxima: Some(n_local_maxima as f64),
             n_upper_limits: meta.n_upper_limits,
             gp_fit_amp: if let Some(ref gp) = gpu_out.dense_gp {
                 finite_or_none(gp.kernel_amp())
@@ -979,7 +1039,98 @@ pub fn fit_nonparametric_with_opts(
         }
     }
 
+    // If no per-band results were produced (all bands < 5 points), try a
+    // cross-band GP that pools observations from all bands after subtracting
+    // per-band mean magnitudes. This enables feature extraction from as few
+    // as 5 total alerts spread across multiple bands.
+    if results.is_empty() {
+        let total_obs: usize = bands.values().map(|b| b.times.len()).sum();
+        if total_obs >= 5 {
+            if let Some(combined) = fit_combined_band(
+                bands, duration, &times_pred, amp_candidates, ls_factors,
+            ) {
+                results.push(combined);
+            }
+        }
+    }
+
     (results, trained_gps)
+}
+
+/// Pool observations from all bands into a single "combined" GP fit.
+///
+/// Subtracts per-band mean magnitudes so that the GP fits the shared light
+/// curve *shape* rather than the absolute brightness in each filter. The
+/// result is returned with `band = "combined"` and `peak_mag` expressed
+/// relative to the mean-subtracted curve (i.e. the magnitude offset from
+/// the per-band average).
+fn fit_combined_band(
+    bands: &HashMap<String, BandData>,
+    duration: f64,
+    times_pred: &[f64],
+    amp_candidates: &[f64],
+    ls_factors: &[f64],
+) -> Option<NonparametricBandResult> {
+    // Pool all bands, subtracting per-band means so that the GP fits the
+    // shared light-curve *shape*. Track the grand mean to restore absolute
+    // magnitudes afterwards.
+    let mut all_times = Vec::new();
+    let mut all_vals = Vec::new();
+    let mut all_errs = Vec::new();
+    let mut grand_sum = 0.0_f64;
+    let mut grand_n = 0usize;
+
+    for bd in bands.values() {
+        if bd.times.is_empty() {
+            continue;
+        }
+        let mean_mag = bd.values.iter().sum::<f64>() / bd.values.len() as f64;
+        for i in 0..bd.times.len() {
+            if bd.values[i].is_finite() && bd.errors[i].is_finite() {
+                all_times.push(bd.times[i]);
+                all_vals.push(bd.values[i] - mean_mag);
+                all_errs.push(bd.errors[i]);
+                grand_sum += bd.values[i];
+                grand_n += 1;
+            }
+        }
+    }
+
+    if all_times.len() < 5 {
+        return None;
+    }
+    let grand_mean = grand_sum / grand_n as f64;
+
+    // Sort by time
+    let mut order: Vec<usize> = (0..all_times.len()).collect();
+    order.sort_by(|&a, &b| all_times[a].total_cmp(&all_times[b]));
+    let times: Vec<f64> = order.iter().map(|&i| all_times[i]).collect();
+    let values: Vec<f64> = order.iter().map(|&i| all_vals[i]).collect();
+    let errors: Vec<f64> = order.iter().map(|&i| all_errs[i]).collect();
+
+    let combined = BandData {
+        times: times.clone(),
+        values: values.clone(),
+        errors: errors.clone(),
+    };
+
+    // Reuse process_band with max_dense_subsample=25
+    process_band(
+        "combined", &combined, duration, times_pred,
+        amp_candidates, ls_factors, 25,
+    )
+    .map(|(mut result, _)| {
+        // Restore absolute magnitudes by adding back the grand mean.
+        // peak_mag, mag_at_30d/60d/90d, gp_predicted_mag_1d/2d are all in
+        // the mean-subtracted system and need the offset.
+        if let Some(ref mut v) = result.peak_mag { *v += grand_mean; }
+        if let Some(ref mut v) = result.gp_predicted_mag_1d { *v += grand_mean; }
+        if let Some(ref mut v) = result.gp_predicted_mag_2d { *v += grand_mean; }
+        if let Some(ref mut v) = result.mag_at_30d { *v += grand_mean; }
+        if let Some(ref mut v) = result.mag_at_60d { *v += grand_mean; }
+        if let Some(ref mut v) = result.mag_at_90d { *v += grand_mean; }
+        result
+    })
 }
 
 /// Process a single band: fit GP, extract features, and build a DenseGP for thermal reuse.
@@ -1219,6 +1370,7 @@ fn process_band(
         peak_mag,
     );
     let monotonicity = compute_post_peak_monotonicity(&pred, peak_idx);
+    let n_local_maxima = count_local_maxima(&pred, 0.1);
 
     let result = NonparametricBandResult {
         band: band_name.to_string(),
@@ -1265,6 +1417,7 @@ fn process_band(
         pre_peak_rms: finite_or_none(pre_peak_rms),
         rise_amplitude_over_noise: finite_or_none(rise_over_noise),
         post_peak_monotonicity: finite_or_none(monotonicity),
+        n_local_maxima: Some(n_local_maxima as f64),
         n_upper_limits,
         gp_fit_amp: finite_or_none(fit_amp),
         gp_fit_lengthscale: finite_or_none(fit_lengthscale),

@@ -5,7 +5,8 @@ use pyo3::types::{PyDict, PyList, PyTuple, PyType};
 use pythonize::pythonize;
 
 use ::lightcurve_fitting::{
-    build_flux_bands as rs_build_flux_bands, build_mag_bands as rs_build_mag_bands,
+    build_flux_bands as rs_build_flux_bands, build_raw_flux_bands as rs_build_raw_flux_bands,
+    build_mag_bands as rs_build_mag_bands,
     eval_model_flux as rs_eval_model_flux, fit_batch_fast as rs_fit_batch_fast,
     fit_batch_parametric as rs_fit_batch_parametric,
     fit_nonparametric as rs_fit_nonparametric,
@@ -108,6 +109,20 @@ fn build_flux_bands(
     bands: Vec<String>,
 ) -> PyResult<PyBandDataMap> {
     let inner = rs_build_flux_bands(&times, &mags, &mag_errs, &bands);
+    Ok(PyBandDataMap { inner })
+}
+
+/// Build per-band flux data from raw (already linear) flux arrays.
+///
+/// Use when flux values are already in linear units (not magnitudes).
+#[pyfunction]
+fn build_raw_flux_bands(
+    times: Vec<f64>,
+    fluxes: Vec<f64>,
+    flux_errs: Vec<f64>,
+    bands: Vec<String>,
+) -> PyResult<PyBandDataMap> {
+    let inner = rs_build_raw_flux_bands(&times, &fluxes, &flux_errs, &bands);
     Ok(PyBandDataMap { inner })
 }
 
@@ -388,6 +403,7 @@ fn lightcurve_fitting(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBandDataMap>()?;
     m.add_function(wrap_pyfunction!(build_mag_bands, m)?)?;
     m.add_function(wrap_pyfunction!(build_flux_bands, m)?)?;
+    m.add_function(wrap_pyfunction!(build_raw_flux_bands, m)?)?;
     m.add_function(wrap_pyfunction!(fit_nonparametric, m)?)?;
     m.add_function(wrap_pyfunction!(fit_parametric, m)?)?;
     m.add_function(wrap_pyfunction!(fit_thermal, m)?)?;

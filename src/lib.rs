@@ -9,7 +9,7 @@ pub mod sparse_gp;
 pub mod thermal;
 
 pub use batch::{FastFitResult, fit_batch_fast, fit_batch_parametric};
-pub use common::{BandData, LightcurveFittingResult, build_mag_bands, build_flux_bands};
+pub use common::{BandData, LightcurveFittingResult, build_mag_bands, build_flux_bands, build_raw_flux_bands};
 pub use nonparametric::{fit_nonparametric, fit_nonparametric_with_opts, NonparametricBandResult};
 #[cfg(feature = "cuda")]
 pub use nonparametric::{fit_nonparametric_batch_gpu, fit_nonparametric_batch_gpu_with_opts};

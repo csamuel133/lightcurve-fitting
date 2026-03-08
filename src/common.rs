@@ -110,6 +110,44 @@ pub fn build_flux_bands(
     result
 }
 
+/// Build per-band flux data from raw flux arrays (no mag→flux conversion).
+///
+/// Use this when you already have linear flux values (e.g. from ZTF forced
+/// photometry or converted log-flux).
+pub fn build_raw_flux_bands(
+    times: &[f64],
+    fluxes: &[f64],
+    flux_errs: &[f64],
+    bands: &[String],
+) -> HashMap<String, BandData> {
+    if times.is_empty() {
+        return HashMap::new();
+    }
+
+    let jd_min = times.iter().copied().fold(f64::INFINITY, f64::min);
+
+    let mut result: HashMap<String, BandData> = HashMap::new();
+    for i in 0..times.len() {
+        let flux = fluxes[i];
+        let flux_err = flux_errs[i];
+        if !flux.is_finite() || !flux_err.is_finite() || flux <= 0.0 || flux_err <= 0.0 {
+            continue;
+        }
+        let entry = result
+            .entry(bands[i].clone())
+            .or_insert_with(|| BandData {
+                times: Vec::new(),
+                values: Vec::new(),
+                errors: Vec::new(),
+            });
+        entry.times.push(times[i] - jd_min);
+        entry.values.push(flux);
+        entry.errors.push(flux_err);
+    }
+
+    result
+}
+
 // ---------------------------------------------------------------------------
 // Math utilities
 // ---------------------------------------------------------------------------

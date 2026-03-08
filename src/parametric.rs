@@ -1248,6 +1248,15 @@ fn pso_model_select(data: &BandFitData, fit_all_models: bool) -> (SviModel, Vec<
     let mut all_chi2: HashMap<SviModelName, Option<f64>> = HashMap::new();
     let mut all_params: HashMap<SviModelName, Vec<f64>> = HashMap::new();
 
+    let n_obs = data.times.len().max(1) as f64;
+    let ln_n = n_obs.ln();
+
+    // BIC from reduced negative log-likelihood: cost = neg_ll / n,
+    // so total_neg_ll = cost * n.  BIC = 2*total_neg_ll + k*ln(n).
+    let bic = |cost: f64, model: SviModel| -> f64 {
+        2.0 * cost * n_obs + (model.n_params() as f64) * ln_n
+    };
+
     // Run Bazin first as an early-stop gate
     let (_, bazin_params, bazin_chi2) = pso_fit_single_model(data, SviModel::Bazin);
     all_chi2.insert(SviModelName::Bazin, finite_or_none(bazin_chi2));
@@ -1258,6 +1267,7 @@ fn pso_model_select(data: &BandFitData, fit_all_models: bool) -> (SviModel, Vec<
     let mut best_model = SviModel::Bazin;
     let mut best_params = bazin_params;
     let mut best_chi2 = bazin_chi2;
+    let mut best_bic = bic(bazin_chi2, SviModel::Bazin);
 
     if !fit_all_models && bazin_chi2 < BAZIN_GOOD_ENOUGH {
         // Bazin is good enough — fill None for skipped models
@@ -1277,7 +1287,9 @@ fn pso_model_select(data: &BandFitData, fit_all_models: bool) -> (SviModel, Vec<
             if fit_all_models {
                 all_params.insert(model.to_name(), params.clone());
             }
-            if chi2 < best_chi2 {
+            let model_bic = bic(chi2, model);
+            if model_bic < best_bic {
+                best_bic = model_bic;
                 best_chi2 = chi2;
                 best_model = model;
                 best_params = params;
@@ -1600,9 +1612,13 @@ fn svi_fit(
                 }
             }
 
+            // Prior centered on PSO init (not the original prior center)
+            // to prevent mu from drifting away from the optimum.
+            // sigma_extra keeps original prior center since PSO pins it at -5.
             let mut log_prior = 0.0;
             for j in 0..n_params {
-                let (center, width) = priors[j];
+                let (orig_center, width) = priors[j];
+                let center = if j == se_idx { orig_center } else { init_mu[j] };
                 let var = width * width;
                 log_prior += -0.5 * (theta[j] - center).powi(2) / var;
                 let dlp = -(theta[j] - center) / var;
@@ -1833,23 +1849,35 @@ fn log_sigma_from_hessian(hessian: &[f64], n: usize) -> Vec<f64> {
 
 /// Laplace approximation: compute Hessian of neg-log-posterior at MAP
 /// estimate via central finite differences, then invert for uncertainties.
+///
+/// The `sigma_extra` parameter is held fixed at its MAP value when computing
+/// the Hessian for the remaining ("shape") parameters.  This prevents
+/// `sigma_extra` from absorbing all curvature information, which previously
+/// left all shape-parameter uncertainties at the uninformative prior width.
+/// The `sigma_extra` slot in the returned `log_sigma` is set from the prior.
 fn laplace_fit(model: SviModel, data: &BandFitData, map_params: &[f64]) -> SviFitResult {
-    let n = map_params.len();
+    let n_full = map_params.len();
+    let se_idx = model.sigma_extra_idx();
     let f0 = neg_log_posterior(model, data, map_params);
 
-    // Central finite-difference Hessian
-    let mut hessian = vec![0.0; n * n];
+    // Indices of shape parameters (everything except sigma_extra)
+    let shape_idxs: Vec<usize> = (0..n_full).filter(|&i| i != se_idx).collect();
+    let n_shape = shape_idxs.len();
+
+    // Central finite-difference Hessian over shape params only
+    let mut hessian = vec![0.0; n_shape * n_shape];
     let mut params_pp = map_params.to_vec();
     let mut params_pm = map_params.to_vec();
     let mut params_mp = map_params.to_vec();
     let mut params_mm = map_params.to_vec();
 
-    for i in 0..n {
+    for si in 0..n_shape {
+        let i = shape_idxs[si];
         let hi = 1e-4 * map_params[i].abs().max(1.0);
-        for j in i..n {
+        for sj in si..n_shape {
+            let j = shape_idxs[sj];
             let hj = 1e-4 * map_params[j].abs().max(1.0);
 
-            // Reset to map_params
             params_pp.copy_from_slice(map_params);
             params_pm.copy_from_slice(map_params);
             params_mp.copy_from_slice(map_params);
@@ -1870,12 +1898,26 @@ fn laplace_fit(model: SviModel, data: &BandFitData, map_params: &[f64]) -> SviFi
             let fmm = neg_log_posterior(model, data, &params_mm);
 
             let h_ij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
-            hessian[i * n + j] = h_ij;
-            hessian[j * n + i] = h_ij;
+            hessian[si * n_shape + sj] = h_ij;
+            hessian[sj * n_shape + si] = h_ij;
         }
     }
 
-    let log_sigma = log_sigma_from_hessian(&hessian, n);
+    let shape_log_sigma = log_sigma_from_hessian(&hessian, n_shape);
+
+    // Reassemble full log_sigma: shape params from Hessian, sigma_extra from prior
+    let priors = prior_params(model);
+    let mut log_sigma = vec![0.0; n_full];
+    let mut si = 0;
+    for i in 0..n_full {
+        if i == se_idx {
+            // sigma_extra: use prior width as uncertainty
+            log_sigma[i] = priors[i].1.ln();
+        } else {
+            log_sigma[i] = shape_log_sigma[si];
+            si += 1;
+        }
+    }
 
     SviFitResult {
         model,
@@ -2241,12 +2283,20 @@ pub fn fit_parametric(
         // Step 3: Profile-likelihood refinement of t0
         profile_t0_refine(&mut svi_result, data);
 
-        // Compute reduced chi² in magnitude space
+        // Compute reduced chi² in magnitude space using SVI mu.
+        // Fall back to PSO params if SVI gives too few positive predictions.
         let svi_preds = eval_model_batch(pso_model, &svi_result.mu, &data.times);
+        let n_pos_svi = svi_preds.iter().filter(|&&p| p * data.peak_flux_obs > 0.0).count();
+        let use_pso_for_mag = n_pos_svi < data.times.len() / 2;
+        let mag_preds = if use_pso_for_mag {
+            eval_model_batch(pso_model, &pso_params, &data.times)
+        } else {
+            svi_preds
+        };
         let mut mag_chi2_sum = 0.0;
         let mut mag_chi2_n = 0usize;
         for i in 0..data.times.len() {
-            let pred_flux = svi_preds[i] * data.peak_flux_obs;
+            let pred_flux = mag_preds[i] * data.peak_flux_obs;
             if pred_flux > 0.0 && data.flux[i] > 0.0 {
                 let mag_pred = flux_to_mag(pred_flux, zp);
                 let mag_obs = mags_obs[i];
