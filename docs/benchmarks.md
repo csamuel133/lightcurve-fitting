@@ -17,7 +17,7 @@ Each run fits **100 light curves** simultaneously.
 
 | Fitter | Description |
 |--------|-------------|
-| **parametric** | PSO model selection (8 models, 20 particles) + Laplace uncertainty |
+| **parametric** | PSO model selection (8 models, 30 particles × 60 iters × 2-3 adaptive restarts) + Laplace uncertainty |
 | **nonparametric** | Gaussian-process interpolation + feature extraction |
 
 ### GP strategy
@@ -37,14 +37,14 @@ Both implementations use hand-rolled inline RBF kernels and row-major Cholesky.
 
 | pts/band | NP CPU | NP GPU | Param CPU | Param GPU |
 |---------:|-------:|-------:|----------:|----------:|
-| 64 | 144K | 2.3M | 30K | 4.1M |
-| 128 | 200K | 3.9M | 33K | 6.5M |
-| 256 | 223K | 6.6M | 34K | 9.0M |
-| 512 | 251K | 9.3M | 35K | 11.2M |
-| 1,024 | 279K | 11.9M | 36K | 12.7M |
-| 2,048 | 302K | 11.4M | 36K | 11.9M |
-| 4,096 | 303K | 15.9M | 36K | 13.1M |
-| 8,192 | 308K | 14.1M | 35K | 13.3M |
+| 64 | 55K | 2.0M | 14K | 5.4M |
+| 128 | 75K | 3.3M | 14K | 8.0M |
+| 256 | 88K | 4.8M | 15K | 10.2M |
+| 512 | 106K | 6.7M | 14K | 12.0M |
+| 1,024 | 122K | 7.2M | 16K | 12.2M |
+| 2,048 | 141K | 8.1M | 17K | 12.6M |
+| 4,096 | 155K | 7.9M | 17K | 12.9M |
+| 8,192 | 279K | 7.8M | 17K | 13.1M |
 
 ### Source-count scaling
 
@@ -54,27 +54,27 @@ of source count (10-1000 sources at 30 pts/band).
 
 ### Discussion
 
-**GPU acceleration**: Both fitters achieve 12-16M obs/sec on GPU at high
-point counts — up to **400x faster than parametric CPU** and **50x faster
+**GPU acceleration**: Both fitters achieve 8-13M obs/sec on GPU at high
+point counts — up to **750x faster than parametric CPU** and **28x faster
 than nonparametric CPU**. The GPU implementations batch all sources into a
 single kernel launch, amortizing launch overhead.
 
 **Parametric GPU vs nonparametric GPU**: At low point counts (64 pts/band),
-parametric GPU is ~2x faster than nonparametric GPU because the PSO
-particle evaluations (20 particles x 50 iterations x 8 models = 8,000
+parametric GPU is ~2.7x faster than nonparametric GPU because the PSO
+particle evaluations (30 particles x 50 iterations x 8 models = 12,000
 work items per source) provide massive thread-level parallelism.
 The nonparametric fit kernel launches one block per band (300 blocks for
 100 sources x 3 bands), with threads parallelizing across hyperparameter
-combos. At high point counts (4096+), nonparametric GPU overtakes
-parametric as the prediction kernel (one thread per observation) fully
-saturates the GPU.
+combos. At high point counts (4096+), parametric GPU maintains its lead
+as both fitters plateau near GPU memory bandwidth limits.
 
-**CPU comparison**: Nonparametric CPU is 5-9x faster than parametric CPU.
-Both plateau above ~1024 pts/band as their respective fixed costs dominate
-(sparse GP fit for nonparametric, PSO iterations for parametric).
+**CPU comparison**: Nonparametric CPU is 4-16x faster than parametric CPU.
+Nonparametric throughput scales well with point count (sparse GP is linear
+in n), while parametric CPU plateaus at ~17K obs/sec as PSO iteration
+cost dominates.
 
 **LSST DDF implications**: At 8,192 pts/band (representative of a
-well-sampled DDF source), GPU processing reaches 14M obs/sec — fitting
+well-sampled DDF source), GPU processing reaches 13M obs/sec — fitting
 100 sources with ~2.5M total observations in under 0.2 seconds.
 
 ## Reproducing

@@ -321,7 +321,37 @@ def plot_parametric(source, outpath, is_persistent=False):
         print(f"  Skipping {obj_id}: no bands with >= {MIN_DET_PER_BAND} detections")
         return
 
-    # Build flux-space bands (strip ztf prefix)
+    # Find display window first, then pass only windowed data to the fitter
+    win_lo, win_hi = find_display_window(raw_bands, band_names, is_persistent)
+    if win_lo is None:
+        print(f"  Skipping {obj_id}: could not determine display window")
+        return
+
+    # For parametric fits, use a tighter window: cap at 200 days from
+    # the brightest point to avoid late-time nebular data that Bazin/Villar
+    # models can't capture.
+    if not is_persistent:
+        # Find peak time across all bands
+        all_t, all_v = [], []
+        for b in band_names:
+            bd = raw_bands[b]
+            t, v, e = np.array(bd["times"]), np.array(bd["values"]), np.array(bd["errors"])
+            mask = detection_mask(v, e)
+            if mask.sum() > 0:
+                all_t.append(t[mask])
+                all_v.append(v[mask])
+        if all_t:
+            all_t = np.concatenate(all_t)
+            all_v = np.concatenate(all_v)
+            t_peak = all_t[np.argmin(all_v)]
+            fit_hi = min(win_hi, t_peak + 200.0)
+        else:
+            fit_hi = win_hi
+        fit_lo = win_lo
+    else:
+        fit_lo, fit_hi = win_lo, win_hi
+
+    # Build flux-space bands from data within the fitting window only
     times_all, mags_all, errs_all, bands_list = [], [], [], []
     short_map = {}  # short_name -> original band name
     for b in band_names:
@@ -329,10 +359,15 @@ def plot_parametric(source, outpath, is_persistent=False):
         short_map[short] = b
         bd = raw_bands[b]
         for t, v, e in zip(bd["times"], bd["values"], bd["errors"]):
-            times_all.append(t)
-            mags_all.append(v)
-            errs_all.append(e)
-            bands_list.append(short)
+            if fit_lo <= t <= fit_hi:
+                times_all.append(t)
+                mags_all.append(v)
+                errs_all.append(e)
+                bands_list.append(short)
+
+    if not times_all:
+        print(f"  Skipping {obj_id}: no data in display window")
+        return
 
     flux_bands = lcf.build_flux_bands(times_all, mags_all, errs_all, bands_list)
     param_results = lcf.fit_parametric(flux_bands, method="laplace")
@@ -341,12 +376,6 @@ def plot_parametric(source, outpath, is_persistent=False):
         return
 
     result_by_band = {r["band"]: r for r in param_results}
-
-    # Find display window
-    win_lo, win_hi = find_display_window(raw_bands, band_names, is_persistent)
-    if win_lo is None:
-        print(f"  Skipping {obj_id}: could not determine display window")
-        return
 
     # Only keep bands that have parametric results
     short_names = [b.replace("ztf", "") for b in band_names
@@ -459,13 +488,17 @@ PLOT_SOURCES = {
     "sn_ib":       ("ZTF18abktmfz", False),
     "sn_ic":       ("ZTF18abfzhct", False),
     "sn_ii":       ("ZTF21abhyqlv", False),
-    "sn_iip":      ("ZTF18aawyjjq", False),
+    "sn_iip":      ("ZTF20aatqesi", False),
     "sn_iin":      ("ZTF19aacjbsj", False),
     "sn_iib":      ("ZTF20abgbuly", False),
     "cataclysmic": ("ZTF18abccqjx", True),
     "agn":         ("ZTF18aalseci", True),
     "tde":         ("ZTF22aadesap", False),
 }
+
+# Parametric models only apply to transients, not persistent variables
+PARAMETRIC_SOURCES = {k: v for k, v in PLOT_SOURCES.items()
+                      if k not in ("agn", "cataclysmic")}
 
 
 # ---------------------------------------------------------------------------
@@ -482,6 +515,11 @@ def main():
 
         np_path = os.path.join(IMG_DIR, f"np_{slug}.png")
         plot_nonparametric(source, np_path, is_persistent=is_persistent)
+
+    for slug, (obj_id, is_persistent) in PARAMETRIC_SOURCES.items():
+        source = sources_by_id[obj_id]
+        label_name = source.get("label_name", slug)
+        print(f"Generating parametric {label_name} ({obj_id})...")
 
         param_path = os.path.join(IMG_DIR, f"param_{slug}.png")
         plot_parametric(source, param_path, is_persistent=is_persistent)

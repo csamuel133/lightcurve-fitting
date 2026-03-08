@@ -958,8 +958,8 @@ impl CostFunction for PsoCost<'_> {
 fn pso_bounds(model: SviModel) -> (Vec<f64>, Vec<f64>) {
     match model {
         SviModel::Bazin => (
-            vec![-3.0, -1.0, -100.0, -2.0, -2.0, -5.0],
-            vec![3.0, 1.0, 100.0, 5.0, 6.0, 0.0],
+            vec![-3.0, -0.3, -100.0, -2.0, -2.0, -5.0],
+            vec![3.0, 0.3, 100.0, 5.0, 6.0, 0.0],
         ),
         SviModel::Villar => (
             vec![-3.0, -0.05, -3.0, -100.0, -2.0, -2.0, -5.0],
@@ -1144,7 +1144,7 @@ fn profile_t0_search(
             problem.cost_from_slice(&full, &mut pred_buf)
         };
         let (best_reduced, cost) = pso_minimize(
-            cost_fn, &lower, &upper, 20, 30, 8, 42,
+            cost_fn, &lower, &upper, 30, 60, 12, 42,
         );
         let mut full = Vec::with_capacity(best_reduced.len() + 1);
         for (i, &val) in best_reduced.iter().enumerate() {
@@ -1209,10 +1209,28 @@ fn pso_fit_single_model(data: &BandFitData, model: SviModel) -> (SviModel, Vec<f
         upper_flux: &data.upper_flux,
         model,
     };
-    let mut pred_buf = vec![0.0; data.times.len()];
-    let cost_fn = |p: &[f64]| problem.cost_from_slice(p, &mut pred_buf);
-    let (params, chi2) = pso_minimize(cost_fn, &lower, &upper, 20, 50, 10, 42);
-    (model, params, chi2)
+
+    // Multi-restart PSO with different seeds to escape local optima.
+    // 30 particles × up to 60 iterations × 2-3 restarts (adaptive).
+    // Third restart only runs if first two disagree significantly.
+    let seeds: &[u64] = &[42, 137, 271];
+    let mut best_params = Vec::new();
+    let mut best_chi2 = f64::INFINITY;
+    let mut first_chi2 = f64::INFINITY;
+    for (i, &seed) in seeds.iter().enumerate() {
+        if i == 2 && (first_chi2 - best_chi2).abs() < 0.1 * best_chi2.abs().max(1e-10) {
+            break;
+        }
+        let mut pred_buf = vec![0.0; data.times.len()];
+        let cost_fn = |p: &[f64]| problem.cost_from_slice(p, &mut pred_buf);
+        let (params, chi2) = pso_minimize(cost_fn, &lower, &upper, 30, 60, 12, seed);
+        if i == 0 { first_chi2 = chi2; }
+        if chi2 < best_chi2 {
+            best_chi2 = chi2;
+            best_params = params;
+        }
+    }
+    (model, best_params, best_chi2)
 }
 
 fn pso_model_select(data: &BandFitData, fit_all_models: bool) -> (SviModel, Vec<f64>, f64, HashMap<SviModelName, Option<f64>>, HashMap<SviModelName, Vec<f64>>) {
@@ -2232,9 +2250,9 @@ pub fn fit_parametric(
             if pred_flux > 0.0 && data.flux[i] > 0.0 {
                 let mag_pred = flux_to_mag(pred_flux, zp);
                 let mag_obs = mags_obs[i];
-                // Use unnormalized flux for correct magnitude error
-                let flux_obs = data.flux[i] * data.peak_flux_obs;
-                let mag_err = 1.0857 * data.flux_err[i] / flux_obs;
+                // Both data.flux_err and data.flux are normalized by peak_flux_obs,
+                // so flux_err/flux gives the correct fractional error.
+                let mag_err = 1.0857 * data.flux_err[i] / data.flux[i];
                 if mag_err > 0.0 {
                     let residual = mag_obs - mag_pred;
                     mag_chi2_sum += residual * residual / (mag_err * mag_err);
