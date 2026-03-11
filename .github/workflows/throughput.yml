@@ -24,7 +24,7 @@ jobs:
         run: cargo build --release --tests
 
       - name: Run throughput benchmark
-        run: cargo test --release throughput -- --ignored --nocapture
+        run: cargo test --release --test throughput throughput_benchmark -- --ignored --nocapture
 
       - name: Upload wall_time.txt as artifact
         if: always()
