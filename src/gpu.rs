@@ -361,6 +361,8 @@ pub struct GpuBatchData {
     d_offsets: DevBuf,
     /// Number of sources.
     pub n_sources: usize,
+    /// Number of observations per source (host copy of offsets diffs).
+    h_n_obs: Vec<usize>,
 }
 
 impl GpuBatchData {
@@ -386,6 +388,8 @@ impl GpuBatchData {
             offsets.push(all_times.len() as c_int);
         }
 
+        let h_n_obs: Vec<usize> = sources.iter().map(|s| s.times.len()).collect();
+
         Ok(Self {
             d_times: DevBuf::upload(&all_times)?,
             d_flux: DevBuf::upload(&all_flux)?,
@@ -394,7 +398,15 @@ impl GpuBatchData {
             d_upper_flux: DevBuf::upload(&all_upper_flux)?,
             d_offsets: DevBuf::upload(&offsets)?,
             n_sources,
+            h_n_obs,
         })
+    }
+}
+
+impl GpuBatchData {
+    /// Number of observations for a given source index.
+    pub fn n_obs_per_source(&self, source_idx: usize) -> usize {
+        self.h_n_obs.get(source_idx).copied().unwrap_or(1)
     }
 }
 
@@ -495,10 +507,15 @@ impl GpuContext {
         let total_particles = n_sources * n_particles;
         let dim = n_params;
 
-        // PSO hyperparameters
-        let w_inertia = 0.7;
+        // PSO hyperparameters — linearly decaying inertia
+        let w_max = 0.9;
+        let w_min = 0.4;
         let c1 = 1.5;
         let c2 = 1.5;
+        let inv_max_iters = 1.0 / max_iters as f64;
+
+        // Velocity clamp: half the domain width per dimension
+        let v_max: Vec<f64> = (0..dim).map(|d| 0.5 * (upper[d] - lower[d])).collect();
 
         // Initialize particles: positions, velocities, personal bests
         // Each source gets its own RNG seed for diversity
@@ -515,7 +532,7 @@ impl GpuContext {
                 let base = (s * n_particles + p) * dim;
                 for d in 0..dim {
                     positions[base + d] = lower[d] + rng.random::<f64>() * (upper[d] - lower[d]);
-                    velocities[base + d] = (upper[d] - lower[d]) * 0.1 * (2.0 * rng.random::<f64>() - 1.0);
+                    velocities[base + d] = v_max[d] * 0.2 * (2.0 * rng.random::<f64>() - 1.0);
                 }
             }
         }
@@ -535,7 +552,10 @@ impl GpuContext {
         let mut stall_count = vec![0usize; n_sources];
         let mut source_done = vec![false; n_sources];
 
-        for _iter in 0..max_iters {
+        for iter in 0..max_iters {
+            // Linearly decay inertia weight
+            let w = w_max - (w_max - w_min) * (iter as f64) * inv_max_iters;
+
             // Upload positions, launch cost kernel
             d_positions.upload_from(&positions)?;
 
@@ -564,6 +584,27 @@ impl GpuContext {
             // Download costs
             d_costs.download_into(&mut h_costs)?;
 
+            // Add population prior penalty (host-side, per-particle)
+            let pop_priors = crate::parametric::population_priors_for_gpu(model);
+            if !pop_priors.is_empty() {
+                for idx in 0..total_particles {
+                    let s = idx / n_particles;
+                    let base = idx * dim;
+                    // n_obs for this source (from offsets)
+                    let n_obs = data.n_obs_per_source(s).max(1) as f64;
+                    let mut neg_lp = 0.0;
+                    for (j, &(center, width)) in pop_priors.iter().enumerate() {
+                        if j < dim && width > 0.0 {
+                            let z = (positions[base + j] - center) / width;
+                            neg_lp += 0.5 * z * z;
+                        }
+                    }
+                    // Scale prior by 1/n_obs² so it decreases with more data
+                    // (same scaling as CPU: prior/n added to NLL/n)
+                    h_costs[idx] += neg_lp / (n_obs * n_obs);
+                }
+            }
+
             // Update personal and global bests
             for s in 0..n_sources {
                 for p in 0..n_particles {
@@ -582,9 +623,11 @@ impl GpuContext {
                 }
             }
 
-            // Update velocities and positions (CPU — lightweight)
+            // Update velocities and positions with clamping and wall absorption
             for s in 0..n_sources {
-                if source_done[s] { continue; }
+                if source_done[s] {
+                    continue;
+                }
                 for p in 0..n_particles {
                     let idx = s * n_particles + p;
                     let base = idx * dim;
@@ -592,11 +635,26 @@ impl GpuContext {
                     for d in 0..dim {
                         let r1: f64 = rng.random();
                         let r2: f64 = rng.random();
-                        velocities[base + d] = w_inertia * velocities[base + d]
+                        let mut v = w * velocities[base + d]
                             + c1 * r1 * (pbest_pos[base + d] - positions[base + d])
                             + c2 * r2 * (gbest_pos[gb + d] - positions[base + d]);
-                        positions[base + d] = (positions[base + d] + velocities[base + d])
-                            .clamp(lower[d], upper[d]);
+
+                        // Clamp velocity magnitude
+                        v = v.clamp(-v_max[d], v_max[d]);
+
+                        let new_pos = positions[base + d] + v;
+
+                        // Wall absorption: clamp and zero velocity on impact
+                        if new_pos <= lower[d] {
+                            positions[base + d] = lower[d];
+                            velocities[base + d] = 0.0;
+                        } else if new_pos >= upper[d] {
+                            positions[base + d] = upper[d];
+                            velocities[base + d] = 0.0;
+                        } else {
+                            positions[base + d] = new_pos;
+                            velocities[base + d] = v;
+                        }
                     }
                 }
             }
@@ -756,8 +814,9 @@ impl GpuContext {
         let mut prev_params: Vec<Vec<f64>> = vec![Vec::new(); n_sources];
         let mut source_stopped = vec![false; n_sources]; // early-stop per source
 
-        // PSO hyperparameters
-        let w_inertia = 0.7;
+        // PSO hyperparameters — linearly decaying inertia
+        let w_max_mb = 0.9;
+        let w_min_mb = 0.4;
         let c1 = 1.5;
         let c2 = 1.5;
 
@@ -853,7 +912,8 @@ impl GpuContext {
                     // Random initialization
                     for d in 0..dim {
                         positions[base + d] = lower[d] + rng.random::<f64>() * (upper[d] - lower[d]);
-                        velocities[base + d] = (upper[d] - lower[d]) * 0.1 * (2.0 * rng.random::<f64>() - 1.0);
+                        let v_max_d = 0.5 * (upper[d] - lower[d]);
+                        velocities[base + d] = v_max_d * 0.2 * (2.0 * rng.random::<f64>() - 1.0);
                     }
                 }
             }
@@ -874,7 +934,13 @@ impl GpuContext {
             let mut stall_count = vec![0usize; n_sources];
             let mut iter_done = vec![false; n_sources];
 
-            for _iter in 0..max_iters {
+            // Velocity clamp for this K
+            let v_max_k: Vec<f64> = (0..dim).map(|d| 0.5 * (upper[d] - lower[d])).collect();
+            let inv_max_iters_k = 1.0 / max_iters as f64;
+
+            for iter in 0..max_iters {
+                let w = w_max_mb - (w_max_mb - w_min_mb) * (iter as f64) * inv_max_iters_k;
+
                 d_positions.upload_from(&positions)?;
 
                 let grid: c_int = ((total_particles as c_int) + block - 1) / block;
@@ -909,19 +975,23 @@ impl GpuContext {
                         if cost < pbest_cost[idx] {
                             pbest_cost[idx] = cost;
                             let base = idx * dim;
-                            pbest_pos[base..base + dim].copy_from_slice(&positions[base..base + dim]);
+                            pbest_pos[base..base + dim]
+                                .copy_from_slice(&positions[base..base + dim]);
                             if cost < gbest_cost[s] {
                                 gbest_cost[s] = cost;
                                 let gb = s * dim;
-                                gbest_pos[gb..gb + dim].copy_from_slice(&positions[base..base + dim]);
+                                gbest_pos[gb..gb + dim]
+                                    .copy_from_slice(&positions[base..base + dim]);
                             }
                         }
                     }
                 }
 
-                // Update velocities and positions
+                // Update velocities and positions with clamping and wall absorption
                 for s in 0..n_sources {
-                    if iter_done[s] || source_stopped[s] { continue; }
+                    if iter_done[s] || source_stopped[s] {
+                        continue;
+                    }
                     for p in 0..n_particles {
                         let idx = s * n_particles + p;
                         let base = idx * dim;
@@ -929,11 +999,23 @@ impl GpuContext {
                         for d in 0..dim {
                             let r1: f64 = rng.random();
                             let r2: f64 = rng.random();
-                            velocities[base + d] = w_inertia * velocities[base + d]
+                            let mut v = w * velocities[base + d]
                                 + c1 * r1 * (pbest_pos[base + d] - positions[base + d])
                                 + c2 * r2 * (gbest_pos[gb + d] - positions[base + d]);
-                            positions[base + d] = (positions[base + d] + velocities[base + d])
-                                .clamp(lower[d], upper[d]);
+
+                            v = v.clamp(-v_max_k[d], v_max_k[d]);
+
+                            let new_pos = positions[base + d] + v;
+                            if new_pos <= lower[d] {
+                                positions[base + d] = lower[d];
+                                velocities[base + d] = 0.0;
+                            } else if new_pos >= upper[d] {
+                                positions[base + d] = upper[d];
+                                velocities[base + d] = 0.0;
+                            } else {
+                                positions[base + d] = new_pos;
+                                velocities[base + d] = v;
+                            }
                         }
                     }
                 }

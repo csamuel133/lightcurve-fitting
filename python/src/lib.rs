@@ -12,6 +12,8 @@ use ::lightcurve_fitting::{
     fit_nonparametric as rs_fit_nonparametric,
     fit_nonparametric_with_opts as rs_fit_nonparametric_with_opts,
     fit_parametric as rs_fit_parametric,
+    fit_parametric_model as rs_fit_parametric_model,
+    fit_parametric_multiband as rs_fit_parametric_multiband,
     fit_thermal as rs_fit_thermal, fit_gp_predict as rs_fit_gp_predict,
     fit_gp_2d_with_thermal as rs_fit_gp_2d_with_thermal,
     metzger_kn_mags as rs_metzger_kn_mags,
@@ -144,6 +146,24 @@ fn parse_uncertainty_method(method: &str) -> PyResult<UncertaintyMethod> {
     }
 }
 
+fn parse_model_name(name: &str) -> PyResult<SviModelName> {
+    match name {
+        "Bazin" | "bazin" => Ok(SviModelName::Bazin),
+        "Villar" | "villar" => Ok(SviModelName::Villar),
+        "MetzgerKN" | "metzgerkn" => Ok(SviModelName::MetzgerKN),
+        "Tde" | "tde" | "TDE" => Ok(SviModelName::Tde),
+        "Arnett" | "arnett" => Ok(SviModelName::Arnett),
+        "Magnetar" | "magnetar" => Ok(SviModelName::Magnetar),
+        "ShockCooling" | "shockcooling" => Ok(SviModelName::ShockCooling),
+        "Afterglow" | "afterglow" => Ok(SviModelName::Afterglow),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown model '{}'. Expected one of: Bazin, Villar, Tde, Arnett, \
+             Magnetar, ShockCooling, Afterglow, MetzgerKN.",
+            other
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Individual fitters
 // ---------------------------------------------------------------------------
@@ -191,6 +211,59 @@ fn fit_parametric(
     let method = parse_uncertainty_method(method)?;
     let inner = bands.inner.clone();
     let results = py.allow_threads(|| rs_fit_parametric(&inner, fit_all_models, method));
+    Ok(pythonize(py, &results)?.unbind())
+}
+
+/// Fit a specific parametric model to per-band flux data.
+///
+/// Like `fit_parametric` but forces a single model instead of running
+/// BIC model selection across all models.
+///
+/// Args:
+///     bands: Band data from `build_flux_bands()` or `build_mag_bands()`.
+///     model: Model name string (e.g. ``"Villar"``, ``"Bazin"``, ``"Tde"``).
+///     fit_all_models: If true, also report chi² for all other models.
+///     method: ``"svi"`` or ``"laplace"``.
+///
+/// Returns a list of dicts, one per band.
+#[pyfunction]
+#[pyo3(signature = (bands, model, fit_all_models=false, method="svi"))]
+fn fit_parametric_model(
+    py: Python<'_>,
+    bands: &PyBandDataMap,
+    model: &str,
+    fit_all_models: bool,
+    method: &str,
+) -> PyResult<PyObject> {
+    let method = parse_uncertainty_method(method)?;
+    let model_name = parse_model_name(model)?;
+    let inner = bands.inner.clone();
+    let results = py.allow_threads(|| rs_fit_parametric_model(&inner, fit_all_models, method, Some(model_name)));
+    Ok(pythonize(py, &results)?.unbind())
+}
+
+/// Joint multi-band Villar fit with relative priors between bands.
+///
+/// Fits all bands simultaneously using the Villar model, with a shared t0
+/// and band-to-band relative priors from de Soto et al. 2024 (superphot+).
+/// The reference band (most observations) gets the full Villar params;
+/// other bands are parameterized as offsets.
+///
+/// Args:
+///     bands: Band data from `build_flux_bands()` or `build_mag_bands()`.
+///     method: ``"svi"`` or ``"laplace"``.
+///
+/// Returns a list of dicts, one per band.
+#[pyfunction]
+#[pyo3(signature = (bands, method="svi"))]
+fn fit_parametric_multiband(
+    py: Python<'_>,
+    bands: &PyBandDataMap,
+    method: &str,
+) -> PyResult<PyObject> {
+    let method = parse_uncertainty_method(method)?;
+    let inner = bands.inner.clone();
+    let results = py.allow_threads(|| rs_fit_parametric_multiband(&inner, method));
     Ok(pythonize(py, &results)?.unbind())
 }
 
@@ -485,6 +558,8 @@ fn lightcurve_fitting(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_raw_flux_bands, m)?)?;
     m.add_function(wrap_pyfunction!(fit_nonparametric, m)?)?;
     m.add_function(wrap_pyfunction!(fit_parametric, m)?)?;
+    m.add_function(wrap_pyfunction!(fit_parametric_model, m)?)?;
+    m.add_function(wrap_pyfunction!(fit_parametric_multiband, m)?)?;
     m.add_function(wrap_pyfunction!(fit_thermal, m)?)?;
     m.add_function(wrap_pyfunction!(fit_fast, m)?)?;
     m.add_function(wrap_pyfunction!(eval_model, m)?)?;
