@@ -435,11 +435,10 @@ __device__ double metzger_kn_at_single(const double* p, double obs_time) {
 
     if (phase <= 0.0) return 0.0;
 
-    // Build grid up to this phase
-    double phase_max = phase * 1.05;
-    if (phase_max < 0.02) phase_max = 0.02;
+    double phase_bin = ceil(phase / 10.0) * 10.0;
+    if (phase_bin < 0.02) phase_bin = 0.02; 
     double log_t_min = log(0.01);
-    double log_t_max = log(phase_max);
+    double log_t_max = log(phase_bin * 1.05);            
     int ngrid = 100; // Reduced grid for PSO (speed vs accuracy tradeoff)
 
     double ye = 0.1;
@@ -546,21 +545,133 @@ extern "C" __global__ void batch_pso_cost(
     double neg_ll = 0.0;
 
     if (model_id == 7) {
-        // MetzgerKN: solve ODE once, evaluate at all observation times
-        // For PSO cost, we solve per-observation (less efficient but avoids
-        // large stack allocation). Each observation gets its own ODE solve.
+        // solve ODE once per particle, interpolate for all obs
+        // (instead of re-solving the ODE per observation)
+        double m_ej = pow(10.0, p[0]) * MSUN_CGS;
+        double v_ej = pow(10.0, p[1]) * C_CGS_VAL;
+        double kappa_r = pow(10.0, p[2]);
+        double t0 = p[3];
+
+        // max phase across all obs for this source
+        double phase_max = 0.01;
         for (int i = obs_start; i < obs_end; i++) {
-            double pred = metzger_kn_at_single(p, all_times[i]);
-            if (!isfinite(pred)) { costs[idx] = 1e99; return; }
+            double ph = all_times[i] - t0;
+            if (ph > phase_max) phase_max = ph;
+        }
 
-            double total_var = all_obs_var[i] + sigma_extra_sq;
+        if (phase_max <= 0.01) {
+            // everything before t0, model is zero
+            for (int i = obs_start; i < obs_end; i++) {
+                double total_var = all_obs_var[i] + sigma_extra_sq;
+                if (all_is_upper[i]) {
+                    double z = all_upper_flux[i] / sqrt(total_var);
+                    neg_ll -= log_normal_cdf_d(z);
+                } else {
+                    double diff = -all_flux[i];
+                    neg_ll += diff * diff / total_var + log(total_var);
+                }
+            }
+        } else {
+            // 200-point forward Euler ODE (same as metzger_kn_eval)
+            double log_t_min = log(0.01);
 
-            if (all_is_upper[i]) {
-                double z = (all_upper_flux[i] - pred) / sqrt(total_var);
-                neg_ll -= log_normal_cdf_d(z);
-            } else {
-                double diff = pred - all_flux[i];
-                neg_ll += diff * diff / total_var + log(total_var);
+            double phase_bin = ceil(phase_max / 10.0) * 10.0;
+            double log_t_max = log(phase_bin * 1.05);
+
+            double ye = 0.1;
+            double xn0 = 1.0 - 2.0 * ye;
+            double scale = 1e40;
+            double e0 = 0.5 * m_ej * v_ej * v_ej;
+            double e_th = e0 / scale;
+            double e_kin = e0 / scale;
+            double v = v_ej;
+
+            double r = exp(log_t_min) * SECS_DAY * v;
+
+            double grid_t[METZGER_NGRID];
+            double grid_lrad[METZGER_NGRID];
+
+            for (int gi = 0; gi < METZGER_NGRID; gi++) {
+                double t_day = exp(log_t_min + (log_t_max - log_t_min) * (double)gi / (double)(METZGER_NGRID - 1));
+                grid_t[gi] = t_day;
+                double t_sec = t_day * SECS_DAY;
+
+                double eth_factor = 0.34 * pow(t_day, 0.74);
+                double eth_log_term = (eth_factor > 1e-10) ? log(1.0 + eth_factor) / eth_factor : 1.0;
+                double eth = 0.36 * (exp(-0.56 * t_day) + eth_log_term);
+
+                double xn = xn0 * exp(-t_sec / 900.0);
+                double eps_neutron = 3.2e14 * xn;
+                double time_term = 0.5 - atan((t_sec - 1.3) / 0.11) / M_PI;
+                if (time_term < 1e-30) time_term = 1e-30;
+                double eps_rp = 2e18 * eth * pow(time_term, 1.3);
+                double l_heat = m_ej * (eps_neutron + eps_rp) / scale;
+
+                double xr = 1.0 - xn0;
+                double xn_decayed = xn0 - xn;
+                double kappa_eff = 0.4 * xn_decayed + kappa_r * xr;
+                double t_diff = 3.0 * kappa_eff * m_ej / (4.0 * M_PI * C_CGS_VAL * v * t_sec) + r / C_CGS_VAL;
+
+                double l_rad = (e_th > 0.0 && t_diff > 0.0) ? e_th / t_diff : 0.0;
+                grid_lrad[gi] = l_rad;
+
+                double l_pdv = (r > 0.0) ? e_th * v / r : 0.0;
+
+                if (gi < METZGER_NGRID - 1) {
+                    double t_next = exp(log_t_min + (log_t_max - log_t_min) * (double)(gi + 1) / (double)(METZGER_NGRID - 1));
+                    double dt_sec = (t_next - t_day) * SECS_DAY;
+                    e_th += (l_heat - l_pdv - l_rad) * dt_sec;
+                    if (e_th < 0.0) e_th = 0.0;
+                    e_kin += l_pdv * dt_sec;
+                    v = sqrt(2.0 * e_kin * scale / m_ej);
+                    if (v > C_CGS_VAL) v = C_CGS_VAL;
+                    r += v * dt_sec;
+                }
+            }
+
+            // normalize by peak luminosity
+            double l_peak = -1e300;
+            for (int gi = 0; gi < METZGER_NGRID; gi++) {
+                if (grid_lrad[gi] > l_peak) l_peak = grid_lrad[gi];
+            }
+
+            if (l_peak <= 0.0 || !isfinite(l_peak)) {
+                costs[idx] = 1e99;
+                return;
+            }
+
+            for (int gi = 0; gi < METZGER_NGRID; gi++) {
+                grid_lrad[gi] /= l_peak;
+            }
+
+            // interpolate for each obs time
+            for (int i = obs_start; i < obs_end; i++) {
+                double phase = all_times[i] - t0;
+                double pred = 0.0;
+
+                if (phase > 0.0 && phase <= grid_t[METZGER_NGRID - 1]) {
+                    // binary search
+                    int lo = 0, hi = METZGER_NGRID - 1;
+                    while (lo < hi - 1) {
+                        int mid = (lo + hi) / 2;
+                        if (grid_t[mid] <= phase) lo = mid; else hi = mid;
+                    }
+                    double frac = (phase - grid_t[lo]) / (grid_t[hi] - grid_t[lo]);
+                    pred = grid_lrad[lo] + frac * (grid_lrad[hi] - grid_lrad[lo]);
+                } else if (phase > grid_t[METZGER_NGRID - 1]) {
+                    pred = grid_lrad[METZGER_NGRID - 1];
+                }
+
+                if (!isfinite(pred)) { costs[idx] = 1e99; return; }
+
+                double total_var = all_obs_var[i] + sigma_extra_sq;
+                if (all_is_upper[i]) {
+                    double z = (all_upper_flux[i] - pred) / sqrt(total_var);
+                    neg_ll -= log_normal_cdf_d(z);
+                } else {
+                    double diff = pred - all_flux[i];
+                    neg_ll += diff * diff / total_var + log(total_var);
+                }
             }
         }
     } else {

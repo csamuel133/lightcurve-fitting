@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use argmin::core::{CostFunction, Executor, Gradient, Error as ArgminError};
@@ -32,6 +33,8 @@ const SIGMA_SB: f64 = 5.6704e-5; // erg/cm²/s/K⁴
 
 /// Sigma inflation factor for mean-field VI posteriors.
 const SIGMA_INFLATION_FACTOR: f64 = 4.0;
+
+const MAX_CACHE: usize = 2000;
 
 // ---------------------------------------------------------------------------
 // Manual Adam optimizer
@@ -541,21 +544,24 @@ fn eval_model_grad(model: SviModel, params: &[f64], t: f64, out: &mut [f64]) {
 // Metzger 1-zone kilonova
 // ---------------------------------------------------------------------------
 
-fn metzger_kn_eval_batch(params: &[f64], obs_times: &[f64]) -> Vec<f64> {
-    let m_ej = 10f64.powf(params[0]) * MSUN_CGS;
-    let v_ej = 10f64.powf(params[1]) * C_CGS;
-    let kappa_r = 10f64.powf(params[2]);
-    let t0 = params[3];
+// cache the ODE so we don't re-solve it when only t0 changes
+fn quantize(x: f64) -> i64 { (x * 1e5).round() as i64 }
 
-    let phases: Vec<f64> = obs_times.iter().map(|&t| t - t0).collect();
-    let phase_max = phases.iter().cloned().fold(0.01f64, f64::max);
-    if phase_max <= 0.01 {
-        return vec![0.0; obs_times.len()];
-    }
+type KnCacheKey = (i64, i64, i64, i64);
+type KnCacheVal = (Vec<f64>, Vec<f64>); // (grid_t_day, grid_norm)
 
+thread_local! {
+    static KN_CACHE: RefCell<HashMap<KnCacheKey, KnCacheVal>> = RefCell::new(HashMap::new());
+}
+
+// the actual ODE solve, factored out so we can cache it
+fn metzger_kn_solve_ode(m_ej: f64, v_ej: f64, kappa_r: f64, phase_max: f64) -> Option<(Vec<f64>, Vec<f64>)> {
     let n_grid: usize = 200;
     let log_t_min = 0.01f64.ln();
-    let log_t_max = (phase_max * 1.05).ln();
+
+    let phase_bin = (phase_max / 10.0).ceil() * 10.0;
+    let log_t_max = (phase_bin * 1.05).ln();
+
     let grid_t_day: Vec<f64> = (0..n_grid)
         .map(|i| (log_t_min + (log_t_max - log_t_min) * i as f64 / (n_grid - 1) as f64).exp())
         .collect();
@@ -621,10 +627,47 @@ fn metzger_kn_eval_batch(params: &[f64], obs_times: &[f64]) -> Vec<f64> {
 
     let l_peak = grid_lrad.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     if l_peak <= 0.0 || !l_peak.is_finite() {
-        return vec![0.0; obs_times.len()];
+        return None;
     }
     let grid_norm: Vec<f64> = grid_lrad.iter().map(|l| l / l_peak).collect();
+    Some((grid_t_day, grid_norm))
+}
 
+fn metzger_kn_eval_batch(params: &[f64], obs_times: &[f64]) -> Vec<f64> {
+    let m_ej = 10f64.powf(params[0]) * MSUN_CGS;
+    let v_ej = 10f64.powf(params[1]) * C_CGS;
+    let kappa_r = 10f64.powf(params[2]);
+    let t0 = params[3];
+
+    let phases: Vec<f64> = obs_times.iter().map(|&t| t - t0).collect();
+    let phase_max = phases.iter().cloned().fold(0.01f64, f64::max);
+    if phase_max <= 0.01 {
+        return vec![0.0; obs_times.len()];
+    }
+
+    let phase_bin = (phase_max / 10.0).ceil() * 10.0;
+    let key = (quantize(params[0]), quantize(params[1]), quantize(params[2]), quantize(phase_bin));
+
+    let cached = KN_CACHE.with(|c| c.borrow().get(&key).cloned());
+    let (grid_t_day, grid_norm) = if let Some(val) = cached {
+        val
+    } else {
+        match metzger_kn_solve_ode(m_ej, v_ej, kappa_r, phase_bin) {
+            Some(val) => {
+                KN_CACHE.with(|c| {
+                    let mut cache = c.borrow_mut();
+                    if cache.len() > MAX_CACHE {
+                        cache.clear();
+                    }
+                    cache.insert(key, val.clone());
+                });
+                val
+            }
+            None => return vec![0.0; obs_times.len()],
+        }
+    };
+
+    let n_grid = grid_t_day.len();
     phases
         .iter()
         .map(|&phase| {
@@ -805,7 +848,7 @@ pub fn metzger_kn_mags(
                 // F_ν = (2h ν³/c²) / (exp(hν/kT) - 1) × (R/d)²
                 let x = H_PLANCK * nu / (K_BOLTZMANN * temp);
                 let x_clamped = x.min(700.0); // avoid overflow
-                let bb_factor = 2.0 * H_PLANCK * nu * nu * nu / (C_CGS * C_CGS);
+                let bb_factor = 2.0 * std::f64::consts::PI * H_PLANCK * nu * nu * nu / (C_CGS * C_CGS);
                 let f_nu = bb_factor / x_clamped.exp_m1() * (r_photo * r_photo / dist_sq);
 
                 if f_nu <= 0.0 || !f_nu.is_finite() {
@@ -1842,7 +1885,7 @@ fn profile_t0_search(
 /// exotic models that won't win.
 const BAZIN_GOOD_ENOUGH: f64 = 2.0;
 
-fn pso_fit_single_model(data: &BandFitData, model: SviModel) -> (SviModel, Vec<f64>, f64) {
+fn pso_fit_single_model_t0(data: &BandFitData, model: SviModel, ref_t0: Option<f64>) -> (SviModel, Vec<f64>, f64) {
     let (mut lower, mut upper) = pso_bounds(model);
     let problem = PsoCost {
         times: &data.times,
@@ -1886,6 +1929,16 @@ fn pso_fit_single_model(data: &BandFitData, model: SviModel) -> (SviModel, Vec<f
         if t0_lo < t0_hi {
             lower[t0_idx] = t0_lo;
             upper[t0_idx] = t0_hi;
+        }
+    }
+
+    // clamp t0 to ±1 day around reference band if provided
+    if let Some(t0_ref) = ref_t0 {
+        let clamped_lo = (t0_ref - 1.0).max(lower[t0_idx]);
+        let clamped_hi = (t0_ref + 1.0).min(upper[t0_idx]);
+        if clamped_lo < clamped_hi {
+            lower[t0_idx] = clamped_lo;
+            upper[t0_idx] = clamped_hi;
         }
     }
 
@@ -1979,7 +2032,7 @@ fn pso_fit_single_model(data: &BandFitData, model: SviModel) -> (SviModel, Vec<f
     (model, refined_params, refined_chi2)
 }
 
-fn pso_model_select(data: &BandFitData, fit_all_models: bool) -> (SviModel, Vec<f64>, f64, HashMap<SviModelName, Option<f64>>, HashMap<SviModelName, Vec<f64>>) {
+fn pso_model_select_t0(data: &BandFitData, fit_all_models: bool, ref_t0: Option<f64>) -> (SviModel, Vec<f64>, f64, HashMap<SviModelName, Option<f64>>, HashMap<SviModelName, Vec<f64>>) {
     let all_models: &[SviModel] = &[
         SviModel::Bazin,
         SviModel::Arnett,
@@ -1997,14 +2050,19 @@ fn pso_model_select(data: &BandFitData, fit_all_models: bool) -> (SviModel, Vec<
     let n_obs = data.times.len().max(1) as f64;
     let ln_n = n_obs.ln();
 
-    // BIC from reduced negative log-likelihood: cost = neg_ll / n,
-    // so total_neg_ll = cost * n.  BIC = 2*total_neg_ll + k*ln(n).
-    let bic = |cost: f64, model: SviModel| -> f64 {
-        2.0 * cost * n_obs + (model.n_params() as f64) * ln_n
+    // AICc when n < 40 (handles sparse lightcurves better), BIC otherwise.
+    let ic = |cost: f64, model: SviModel| -> f64 {
+        let k = model.n_params() as f64;
+        let total_nll = 2.0 * cost * n_obs;
+        if n_obs < 40.0 && n_obs > k + 1.0 {
+            total_nll + 2.0 * k + 2.0 * k * (k + 1.0) / (n_obs - k - 1.0)
+        } else {
+            total_nll + k * ln_n
+        }
     };
 
     // Run Bazin first as an early-stop gate
-    let (_, bazin_params, bazin_chi2) = pso_fit_single_model(data, SviModel::Bazin);
+    let (_, bazin_params, bazin_chi2) = pso_fit_single_model_t0(data, SviModel::Bazin, ref_t0);
     all_chi2.insert(SviModelName::Bazin, finite_or_none(bazin_chi2));
     if fit_all_models {
         all_params.insert(SviModelName::Bazin, bazin_params.clone());
@@ -2013,7 +2071,7 @@ fn pso_model_select(data: &BandFitData, fit_all_models: bool) -> (SviModel, Vec<
     let mut best_model = SviModel::Bazin;
     let mut best_params = bazin_params;
     let mut best_chi2 = bazin_chi2;
-    let mut best_bic = bic(bazin_chi2, SviModel::Bazin);
+    let mut best_ic = ic(bazin_chi2, SviModel::Bazin);
 
     if !fit_all_models && bazin_chi2 < BAZIN_GOOD_ENOUGH {
         // Bazin is good enough — fill None for skipped models
@@ -2025,7 +2083,7 @@ fn pso_model_select(data: &BandFitData, fit_all_models: bool) -> (SviModel, Vec<
         let rest = &all_models[1..];
         let results: Vec<(SviModel, Vec<f64>, f64)> = rest
             .par_iter()
-            .map(|&model| pso_fit_single_model(data, model))
+            .map(|&model| pso_fit_single_model_t0(data, model, ref_t0))
             .collect();
 
         for (model, params, chi2) in results {
@@ -2033,9 +2091,9 @@ fn pso_model_select(data: &BandFitData, fit_all_models: bool) -> (SviModel, Vec<
             if fit_all_models {
                 all_params.insert(model.to_name(), params.clone());
             }
-            let model_bic = bic(chi2, model);
-            if model_bic < best_bic {
-                best_bic = model_bic;
+            let model_ic = ic(chi2, model);
+            if model_ic < best_ic {
+                best_ic = model_ic;
                 best_chi2 = chi2;
                 best_model = model;
                 best_params = params;
@@ -2213,7 +2271,25 @@ fn svi_fit(
     };
     for i in 0..n_params {
         var_params[i] = init_mu[i];
-        var_params[n_params + i] = -1.0;
+    }
+    // estimate initial sigma from local curvature at PSO solution
+    if pso_init.is_some() {
+        let f_center = neg_log_posterior(model, data, &init_mu);
+        for i in 0..n_params {
+            let h = 1e-3 * init_mu[i].abs().max(0.1);
+            let mut p = init_mu.clone();
+            p[i] = init_mu[i] + h;
+            let f_plus = neg_log_posterior(model, data, &p);
+            p[i] = init_mu[i] - h;
+            let f_minus = neg_log_posterior(model, data, &p);
+            let curv = ((f_plus + f_minus - 2.0 * f_center) / (h * h)).max(1e-6);
+            let log_sig = (1.0 / curv.sqrt()).ln();
+            var_params[n_params + i] = if log_sig.is_finite() { log_sig.clamp(-6.0, 2.0) } else { -1.0 };
+        }
+    } else {
+        for i in 0..n_params {
+            var_params[n_params + i] = -1.0;
+        }
     }
 
     let mut adam = ManualAdam::new(n_variational, lr);
@@ -2240,14 +2316,22 @@ fn svi_fit(
     let mut final_elbo = f64::NEG_INFINITY;
 
     // Early stopping: track smoothed ELBO and stop when it stalls.
-    let svi_stall_iters = 50;
-    let svi_min_iters = 200; // always run at least this many
-    let ema_alpha = 0.1;
+    let svi_stall_iters = 30;
+    let svi_min_iters = 100; // always run at least this many
+    let ema_alpha = 0.2;
     let mut ema_elbo = f64::NEG_INFINITY;
     let mut best_ema_elbo = f64::NEG_INFINITY;
     let mut iters_without_improvement = 0usize;
 
+    let base_lr = lr;
     for _step in 0..n_steps {
+        // Cosine annealing LR
+        adam.lr = if _step < 50 {
+            base_lr * 0.1 + base_lr * 0.9 * _step as f64 / 50.0
+        } else {
+            let progress = (_step - 50) as f64 / (n_steps - 50).max(1) as f64;
+            base_lr * (0.1 + 0.9 * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos()))
+        };
         let mu = &var_params[..n_params];
         let log_sigma = &var_params[n_params..];
         for j in 0..n_params {
@@ -2391,6 +2475,15 @@ fn svi_fit(
         for j in 0..n_params {
             neg_elbo_grad[j] = -grad_mu[j];
             neg_elbo_grad[n_params + j] = -(grad_log_sigma[j] + 1.0);
+        }
+
+        // Prevent SVI blow up.
+        let grad_norm_sq: f64 = neg_elbo_grad.iter().map(|g| g * g).sum();
+        if grad_norm_sq > 100.0 {
+            let scale = 10.0 / grad_norm_sq.sqrt();
+            for g in neg_elbo_grad.iter_mut() {
+                *g *= scale;
+            }
         }
 
         adam.step(&mut var_params, &neg_elbo_grad);
@@ -2610,12 +2703,22 @@ fn laplace_fit(model: SviModel, data: &BandFitData, map_params: &[f64]) -> SviFi
     let shape_idxs: Vec<usize> = (0..n_full).filter(|&i| i != se_idx).collect();
     let n_shape = shape_idxs.len();
 
-    // Central finite-difference Hessian over shape params only
+    // Hessian via Richardson extrapolation (two step sizes for better accuracy)
     let mut hessian = vec![0.0; n_shape * n_shape];
-    let mut params_pp = map_params.to_vec();
-    let mut params_pm = map_params.to_vec();
-    let mut params_mp = map_params.to_vec();
-    let mut params_mm = map_params.to_vec();
+    let mut buf = map_params.to_vec();
+
+    // central difference helper
+    let hess_elem = |i: usize, j: usize, hi: f64, hj: f64, buf: &mut Vec<f64>| -> f64 {
+        buf.copy_from_slice(map_params); buf[i] += hi; buf[j] += hj;
+        let fpp = neg_log_posterior(model, data, buf);
+        buf.copy_from_slice(map_params); buf[i] += hi; buf[j] -= hj;
+        let fpm = neg_log_posterior(model, data, buf);
+        buf.copy_from_slice(map_params); buf[i] -= hi; buf[j] += hj;
+        let fmp = neg_log_posterior(model, data, buf);
+        buf.copy_from_slice(map_params); buf[i] -= hi; buf[j] -= hj;
+        let fmm = neg_log_posterior(model, data, buf);
+        (fpp - fpm - fmp + fmm) / (4.0 * hi * hj)
+    };
 
     for si in 0..n_shape {
         let i = shape_idxs[si];
@@ -2624,26 +2727,12 @@ fn laplace_fit(model: SviModel, data: &BandFitData, map_params: &[f64]) -> SviFi
             let j = shape_idxs[sj];
             let hj = 1e-4 * map_params[j].abs().max(1.0);
 
-            params_pp.copy_from_slice(map_params);
-            params_pm.copy_from_slice(map_params);
-            params_mp.copy_from_slice(map_params);
-            params_mm.copy_from_slice(map_params);
+            let h_coarse = hess_elem(i, j, hi, hj, &mut buf);
+            let h_fine = hess_elem(i, j, hi * 0.5, hj * 0.5, &mut buf);
 
-            params_pp[i] += hi;
-            params_pp[j] += hj;
-            params_pm[i] += hi;
-            params_pm[j] -= hj;
-            params_mp[i] -= hi;
-            params_mp[j] += hj;
-            params_mm[i] -= hi;
-            params_mm[j] -= hj;
-
-            let fpp = neg_log_posterior(model, data, &params_pp);
-            let fpm = neg_log_posterior(model, data, &params_pm);
-            let fmp = neg_log_posterior(model, data, &params_mp);
-            let fmm = neg_log_posterior(model, data, &params_mm);
-
-            let h_ij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
+            // Richardson: cancels O(h^2) error -> O(h^4)
+            let h_rich = (4.0 * h_fine - h_coarse) / 3.0;
+            let h_ij = if h_rich.is_finite() { h_rich } else { h_coarse };
             hessian[si * n_shape + sj] = h_ij;
             hessian[sj * n_shape + si] = h_ij;
         }
@@ -3613,11 +3702,14 @@ pub fn fit_parametric_model(
     band_entries.sort_by(|a, b| b.1.times.len().cmp(&a.1.times.len()));
 
     let mut results: Vec<ParametricBandResult> = Vec::new();
+    let mut ref_t0: Option<f64> = None; // set after reference band fit
 
     for (band_idx, (band_name, data, mags_obs)) in band_entries.iter().enumerate() {
         // Step 1: PSO model selection (or forced single model)
+        // non-reference bands get t0 clamped to ±1 day of reference
+        let t0_hint = if band_idx > 0 { ref_t0 } else { None };
         let (pso_model, pso_params, pso_chi2, per_model_chi2, per_model_params) = if let Some(model) = forced_model {
-            let (_, params, chi2) = pso_fit_single_model(data, SviModel::from_name(&model));
+            let (_, params, chi2) = pso_fit_single_model_t0(data, SviModel::from_name(&model), t0_hint);
             let mut chi2_map = HashMap::new();
             chi2_map.insert(model.clone(), finite_or_none(chi2));
             let mut params_map = HashMap::new();
@@ -3626,7 +3718,7 @@ pub fn fit_parametric_model(
             }
             (SviModel::from_name(&model), params, chi2, chi2_map, params_map)
         } else {
-            pso_model_select(data, fit_all_models)
+            pso_model_select_t0(data, fit_all_models, t0_hint)
         };
 
         if pso_params.is_empty() {
@@ -3657,6 +3749,11 @@ pub fn fit_parametric_model(
         // Step 3: Profile-likelihood refinement of t0 and all params
         profile_t0_refine(&mut svi_result, data);
         profile_refine_all(&mut svi_result, data);
+
+        // lock in reference band t0 for remaining bands
+        if band_idx == 0 {
+            ref_t0 = Some(svi_result.mu[pso_model.t0_idx()]);
+        }
 
         // Compute reduced chi² in magnitude space using SVI mu.
         // Fall back to PSO params if SVI gives too few positive predictions.
